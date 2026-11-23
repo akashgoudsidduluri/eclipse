@@ -47,6 +47,42 @@ re-observing → checkpoint + log.
 10. Load the extension unpacked in Chrome (`extension/`, `npm run build` first).
 11. Open the workspace: `http://127.0.0.1:8000/workspace` (paste the token from step 5) or the proof page: `http://127.0.0.1:8000/proof`.
 
+## Model providers — the brain (.env)
+
+The chat brain and the planner call models through a local-first
+chain (PR #7): **Ollama → Antseed → Groq**. The first provider
+that answers wins; a provider that fails (Ollama not running, a
+dead gateway) is skipped at once. Every chat reply is labelled
+with the provider that answered (`provider` in the
+POST /chat/message response, `null` when the rules answered) —
+and GET /brain shows which providers are configured, in chain
+order, and whether each one answers a cheap probe. A missing
+model is visible there, not silent.
+
+Keys live in a `.env` file at the repo root (copy
+`.env.example`, fill in your own keys) or in the real
+environment — never in the repo (`.env` is gitignored). The
+server loads `.env` at startup, before any server module reads
+the environment. Real environment variables win over `.env`
+values.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local Ollama (no key needed — must be running on this machine) |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Local model |
+| `ANTSEED_API_KEY` | — (vault surrogate when unset) | Antseed gateway key |
+| `ANTSEED_BASE_URL` | `https://akash-antseed.duckdns.org/v1` | Antseed gateway. **This default is Akash's gateway** — if you run your own gateway, point this at it, e.g. `ANTSEED_BASE_URL=https://prateek-antseed.duckdns.org/v1` |
+| `ANTSEED_MODEL` | `google-gemma-4-31b-it` | Antseed model |
+| `GROQ_API_KEY` | — (Groq skipped when unset) | Groq key |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq endpoint |
+| `GROQ_MODEL` | `gpt-oss-120b` | Groq model |
+| `ECLIPSE_PROVIDER_ORDER` | `ollama,antseed,groq` | Chain order override, e.g. `ECLIPSE_PROVIDER_ORDER=groq,ollama,antseed`. Providers not listed keep their default relative order |
+
+Without any key and without Ollama running, the chat still
+works — the rules answer greetings, name statements and clear
+instructions, and anything else gets an honest "I couldn't
+reach a model" reply instead of a repeated question.
+
 ## Architecture — 3 tiers, local first
 
 - **Tier 1, Extension** (Chrome MV3, `extension/`): perceive + redact +
@@ -58,9 +94,10 @@ re-observing → checkpoint + log.
   RAG. One SQLite file (`data/eclipse.db`, WAL). The server is the ONLY
   SQLite writer. Vault file separate, Fernet-encrypted, never in SQLite.
 - **Tier 3, Cloud planner** (redacted input only, open-weights only):
-  own Antseed gateway (verified free models, gemma-4-31b live planner),
-  then OrcaRouter free, then Groq gpt-oss-120b, then Ollama local
-  qwen2.5:7b. Never silently fall back from local mode to cloud.
+  local-first chain (PR #7) — Ollama local qwen2.5:7b, then the own
+  Antseed gateway (verified free models, gemma-4-31b live planner),
+  then Groq gpt-oss-120b, then OrcaRouter free when fully
+  configured. Never silently fall back from local mode to cloud.
 
 ## Status — honest grades
 

@@ -43,6 +43,7 @@ import uuid
 from ..core import audit, db
 from ..memory import keyword
 from ..planner import context as ctx
+from ..planner import deterministic as det
 from ..planner import prompts, router, scan, validate
 
 logger = logging.getLogger("eclipse.tasks")
@@ -125,29 +126,10 @@ def _audit(conn, task_id: str, action: str, payload: dict) -> None:
     audit.append(conn, task_id, action, payload)
 
 
-def plan_task(conn, task_id: str, call_fn=None) -> list[dict]:
-    """Decompose the goal into steps (one planner call)."""
-    task = get_task(conn, task_id)
-    if task is None:
-        raise KeyError(f"no task {task_id}")
-    # Planning is one-shot: a second plan call would INSERT a
-    # duplicate set of steps (same n) and resurrect a finished
-    # task. A plan that failed part-way leaves the task "created",
-    # so re-planning after a failure still works.
-    if task["status"] != "created":
-        raise ValueError(
-            f"task {task_id} is {task['status']}; refusing to re-plan"
-        )
-    call_fn = call_fn or router.call_planner
-    facts = _memory_facts(conn, task["goal"])
-    prompt = prompts.build_plan_prompt(task["goal"], task["constraints"], facts)
-    # Second PII scan before the outbound call (§6.4).
-    prompt, hits = scan.redact(prompt)
-    if hits:
-        logger.warning("task %s plan prompt had %d PII hits (re-redacted)", task_id, len(hits))
-    raw, model, ms = call_fn(prompt, local_only=_is_local_only(task["constraints"]))
-    logger.info("task %s planned via %s in %.0f ms", task_id, model, ms)
-    steps = validate.parse_plan(raw)
+def _insert_plan(conn, task_id: str, steps: list[dict], model: str) -> list[dict]:
+    """Store a plan's steps and mark the task planned (shared by
+    the deterministic path and the planner path — one insert,
+    one audit entry, no drift)."""
     now = int(time.time())
     for i, step in enumerate(steps, start=1):
         conn.execute(
@@ -166,6 +148,47 @@ def plan_task(conn, task_id: str, call_fn=None) -> list[dict]:
     _set_task_status(conn, task_id, "planned")
     _audit(conn, task_id, "task.plan", {"steps": len(steps), "model": model})
     return steps
+
+
+def plan_task(conn, task_id: str, call_fn=None) -> list[dict]:
+    """Decompose the goal into steps (one planner call — unless
+    the goal is a pure navigation, which plans deterministically
+    with no model at all; see server/planner/deterministic.py)."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"no task {task_id}")
+    # Planning is one-shot: a second plan call would INSERT a
+    # duplicate set of steps (same n) and resurrect a finished
+    # task. A plan that failed part-way leaves the task "created",
+    # so re-planning after a failure still works.
+    if task["status"] != "created":
+        raise ValueError(
+            f"task {task_id} is {task['status']}; refusing to re-plan"
+        )
+    # PR #7 (W3): a pure navigation goal ("open google") plans
+    # WITHOUT any planner call — this runs BEFORE the prompt is
+    # built, so a deterministic goal never touches the planner,
+    # its quota, or the network. The resolver enforces the
+    # task's allow-list itself; a goal it cannot resolve (or
+    # that the allow-list rejects) falls through to the planner
+    # path below unchanged.
+    det_steps = det.deterministic_plan(
+        task["goal"], allowed_sites=_allowed_sites(task["constraints"])
+    )
+    if det_steps is not None:
+        logger.info("task %s planned deterministically (navigate)", task_id)
+        return _insert_plan(conn, task_id, det_steps, "deterministic")
+    call_fn = call_fn or router.call_planner
+    facts = _memory_facts(conn, task["goal"])
+    prompt = prompts.build_plan_prompt(task["goal"], task["constraints"], facts)
+    # Second PII scan before the outbound call (§6.4).
+    prompt, hits = scan.redact(prompt)
+    if hits:
+        logger.warning("task %s plan prompt had %d PII hits (re-redacted)", task_id, len(hits))
+    raw, model, ms = call_fn(prompt, local_only=_is_local_only(task["constraints"]))
+    logger.info("task %s planned via %s in %.0f ms", task_id, model, ms)
+    steps = validate.parse_plan(raw)
+    return _insert_plan(conn, task_id, steps, model)
 
 
 def _get_step(conn, task_id: str, n: int) -> dict | None:
@@ -798,6 +821,58 @@ def execute_step(
     allowed_sites = _allowed_sites(task["constraints"])
     local_only = _is_local_only(task["constraints"])
 
+    # PR #7 (W3): a deterministic plan step already carries its
+    # action ({"action": "navigate", "url": ...} — only
+    # deterministic plans do; validate.parse_plan strips these
+    # keys from planner plans). It executes with NO planner
+    # call: the URL was resolved from the user's own words at
+    # plan time and is re-validated here against the task's
+    # allow-list, so a constraint added since planning (a
+    # refinement) still fails closed. current_url is NOT passed
+    # to validate: the destination is the user's own typed goal,
+    # not planner output a page could have steered, so the
+    # current-site rule does not apply. The navigate target is
+    # added to the returned allow-list so the executor permits
+    # this one navigation from a fresh tab (executor.ts fails
+    # closed to the current site without an allow-list entry).
+    # A navigate is never consequential (no submit/send/pay), so
+    # no approval gate applies; the human-only, already-done and
+    # task-state guards above all still apply.
+    if plan_step.get("action") == "navigate" and plan_step.get("url"):
+        det_action = {"action": "navigate", "url": plan_step["url"]}
+        validate.validate_action(
+            det_action, element_ids, interactable_ids, allowed_sites,
+        )
+        stored = dict(det_action)
+        stored["step"] = plan_step.get("step", n)
+        stored["description"] = plan_step.get("description", "")
+        stored["expected_end_state"] = plan_step.get("expected_end_state", "")
+        stored["_consequential"] = False
+        det_now = int(time.time())
+        conn.execute(
+            "UPDATE steps SET action_json = ?, element_id = ?, status = 'executing',"
+            " started_at = ?, ms = ?, grounding_failures = 0"
+            " WHERE task_id = ? AND n = ?",
+            (json.dumps(stored), None, det_now, 0, task_id, n),
+        )
+        conn.commit()
+        _audit(conn, task_id, "task.execute",
+               {"step": n, "action": "navigate", "model": "deterministic"})
+        from urllib.parse import urlparse as _urlparse
+
+        det_host = (_urlparse(det_action["url"]).hostname or "").lower()
+        det_allowed = sorted({*(allowed_sites or []), det_host} - {""})
+        return {
+            "action": det_action,
+            "expected_end_state": plan_step.get("expected_end_state", ""),
+            "model": "deterministic",
+            "task_id": task_id,
+            "element": None,
+            "allowed_sites": det_allowed,
+            "fill": {},
+            "fill_denied_reason": None,
+        }
+
     # Second PII scan before the outbound planner call (§6.4).
     # A hit is re-redacted and logged; two blocks on the same step
     # stop the task.
@@ -1295,6 +1370,27 @@ def verify_step(
                 if word in texts.lower() and word not in base_text:
                     verified, reason = True, f"confirmation text appeared ({word})"
                     break
+    # 4b. Navigate (PR #7, W3): the new URL's host IS the
+    # target host, and the previous URL's host was different —
+    # or there was no previous URL (a fresh tab, where there is
+    # no baseline to diff against and reaching the target host
+    # is the whole end state). Navigating to the page already
+    # showing does NOT verify (the end state was pre-existing);
+    # the generic URL-change fallback below still catches a
+    # navigate that landed on a different page of the same host.
+    if not verified and action.get("action") == "navigate" and action.get("url"):
+        from urllib.parse import urlparse as _urlparse
+
+        target_host = (_urlparse(action["url"]).hostname or "").lower()
+        new_host = (
+            _urlparse(new_observation.get("url", "")).hostname or ""
+        ).lower()
+        prev_host = (
+            (_urlparse(previous_url).hostname or "").lower()
+            if previous_url else ""
+        )
+        if target_host and new_host == target_host and new_host != prev_host:
+            verified, reason = True, f"reached {target_host}"
     # 5. Generic fallback: the URL changed.
     if not verified and url and previous_url and url != previous_url:
         verified, reason = True, f"URL changed to {url}"

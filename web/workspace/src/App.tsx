@@ -2,8 +2,6 @@ import { Component, lazy, Suspense, useEffect, useRef, useState, type ReactNode 
 import { api, clearToken, getToken, setToken, type QuotaModel } from "./api";
 import { AgentView } from "./views/AgentView";
 import { MissionsView } from "./views/MissionsView";
-import { JobsView } from "./views/JobsView";
-import { MailView } from "./views/MailView";
 import { WatchesView } from "./views/WatchesView";
 import { ConnectorsView } from "./views/ConnectorsView";
 import { VaultView } from "./views/VaultView";
@@ -22,8 +20,6 @@ const BoundaryScene = lazy(() =>
 type ViewId =
   | "agent"
   | "missions"
-  | "jobs"
-  | "mail"
   | "watches"
   | "connectors"
   | "vault"
@@ -33,7 +29,7 @@ type ViewId =
 
 /** Nav icons (PR #6 Worker 11): one small geometric mark
  * per view, 18px, 1.5 stroke, currentColor — the same
- * stroke and size across all ten, so the labels align in
+ * stroke and size across all eight, so the labels align in
  * one column. */
 function NavIcon({ d, extra }: { d: string; extra?: ReactNode }) {
   return (
@@ -61,16 +57,6 @@ const VIEWS: { id: ViewId; label: string; icon: ReactNode }[] = [
         }
       />
     ),
-  },
-  {
-    id: "jobs",
-    label: "Jobs",
-    icon: <NavIcon d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 12h18" extra={<rect x="3" y="7" width="18" height="13" rx="2" />} />,
-  },
-  {
-    id: "mail",
-    label: "Mail",
-    icon: <NavIcon d="m3 7 9 6 9-6" extra={<rect x="3" y="5" width="18" height="14" rx="2" />} />,
   },
   {
     id: "watches",
@@ -180,6 +166,40 @@ function NavList({
   );
 }
 
+/** The footer status bar. Rendered INSIDE .shell in the
+ * connected view (a full-width wrapped row — the sticky
+ * sidebar's range ends at the shell's content bottom, so
+ * the footer must live inside it) and after the token gate
+ * when not connected. */
+function StatusBar({
+  token,
+  serverUp,
+  selectedId,
+  view,
+  currentLabel,
+}: {
+  token: string | null;
+  serverUp: boolean | null;
+  selectedId: string | null;
+  view: ViewId;
+  currentLabel: string;
+}) {
+  return (
+    <footer className="statusbar">
+      <p role="status" aria-live="polite">
+        {token
+          ? serverUp === false
+            ? "Server unreachable — showing the last data fetched."
+            : selectedId && view === "agent"
+              ? `Task ${selectedId} selected.`
+              : `${currentLabel} view.`
+          : "Not connected."}
+      </p>
+      <p className="muted">Local only — the server binds 127.0.0.1, and raw PII never leaves this device.</p>
+    </footer>
+  );
+}
+
 export default function App() {
   const [token, setTokenState] = useState<string | null>(() => getToken());
   const [tokenInput, setTokenInput] = useState("");
@@ -195,6 +215,27 @@ export default function App() {
   const [quota, setQuota] = useState<QuotaModel[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const drawerRef = useRef<HTMLDialogElement | null>(null);
+  // PR #7: the sidebar is sticky below the topbar, and the
+  // topbar's height varies with viewport width (it wraps) —
+  // so the real height is measured and published as a CSS
+  // variable the sidebar's `top` reads. ResizeObserver keeps
+  // it correct when the HUD appears/disappears or the window
+  // resizes; app.css carries a fallback until the first
+  // measurement lands.
+  const appRef = useRef<HTMLDivElement | null>(null);
+  const topbarRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const bar = topbarRef.current;
+    const app = appRef.current;
+    if (!bar || !app) return;
+    const setHeight = () =>
+      app.style.setProperty("--topbar-height", `${bar.offsetHeight}px`);
+    setHeight();
+    const observer = new ResizeObserver(setHeight);
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, []);
 
   const saveToken = () => {
     const t = tokenInput.trim();
@@ -301,7 +342,7 @@ export default function App() {
   const quotaHot = quotaLimit > 0 && quotaUsed / quotaLimit >= 0.8;
 
   return (
-    <div className="app">
+    <div className="app" ref={appRef}>
       {/* PR #6 motion: fixed drifting-gradient layer behind all
           content (aria-hidden, pointer-events none). The shell,
           token gate and statusbar sit above it via z-index. */}
@@ -309,7 +350,7 @@ export default function App() {
       <a href="#main" className="skip-link">
         Skip to main content
       </a>
-      <header className="topbar">
+      <header className="topbar" ref={topbarRef}>
         {token && (
           <button
             type="button"
@@ -489,11 +530,9 @@ export default function App() {
                     setSelectedId(id);
                     setView("agent");
                   }}
-                  onGoToJobs={() => setView("jobs")}
+                  onGoToAgent={() => setView("agent")}
                 />
               )}
-              {view === "jobs" && <JobsView token={token} />}
-              {view === "mail" && <MailView token={token} />}
               {view === "watches" && <WatchesView token={token} />}
               {view === "connectors" && <ConnectorsView token={token} />}
               {view === "vault" && <VaultView token={token} />}
@@ -502,6 +541,13 @@ export default function App() {
               {view === "audit" && <AuditView token={token} />}
             </ViewErrorBoundary>
           </main>
+          <StatusBar
+            token={token}
+            serverUp={serverUp}
+            selectedId={selectedId}
+            view={view}
+            currentLabel={currentLabel}
+          />
         </div>
       )}
 
@@ -521,18 +567,15 @@ export default function App() {
         <NavList view={view} approvalCount={pendingApprovals} onNavigate={navigate} />
       </dialog>
 
-      <footer className="statusbar">
-        <p role="status" aria-live="polite">
-          {token
-            ? serverUp === false
-              ? "Server unreachable — showing the last data fetched."
-              : selectedId && view === "agent"
-                ? `Task ${selectedId} selected.`
-                : `${currentLabel} view.`
-            : "Not connected."}
-        </p>
-        <p className="muted">Local only — the server binds 127.0.0.1, and raw PII never leaves this device.</p>
-      </footer>
+      {!token && (
+        <StatusBar
+          token={token}
+          serverUp={serverUp}
+          selectedId={selectedId}
+          view={view}
+          currentLabel={currentLabel}
+        />
+      )}
     </div>
   );
 }

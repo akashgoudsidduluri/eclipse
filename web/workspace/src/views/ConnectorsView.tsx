@@ -22,6 +22,7 @@ import {
   StatusChip,
   humanStatus,
   statusTone,
+  type ChipTone,
 } from "../components/ui";
 import "./ConnectorsView.css";
 
@@ -47,22 +48,47 @@ function fmtIn(ts: number, nowMs: number): string {
   return days === 1 ? "in 1 day" : `in ${days} days`;
 }
 
-/** One plain-words line for a connector's state. */
+/** One plain-words line for a connector's CONNECTION state.
+ * This is about whether Eclipse can actually reach the
+ * account — never the enabled on/off flag, which only says
+ * whether Eclipse is allowed to use it (shown separately). */
 function stateLine(row: ConnectorRow, live?: ConnectorLiveStatus): string {
-  if (!row.enabled) return "Off — Eclipse won't use it until it's turned back on.";
   const state = live?.state ?? row.state;
   switch (state) {
     case "connected":
       return "Connected and ready.";
     case "needs_reconnect":
-      return "The Google grant expired or was revoked.";
+      return "Not connected — the Google grant expired or was revoked.";
     case "unavailable":
       return "Unavailable right now — the check couldn't reach it.";
     case null:
     case undefined:
-      return "Status unknown — check the live status.";
+      return "Not checked yet — check the live status to see whether it's connected.";
     default:
       return `Status: ${state.replaceAll("_", " ")}.`;
+  }
+}
+
+/** The connection chip: Connected / Not connected /
+ * Unavailable / Not checked yet. The enabled on/off flag is
+ * never shown as a connection — "On" used to read as
+ * connected when the account was never linked. */
+function connectionChip(state: string | null | undefined): {
+  label: string;
+  tone: ChipTone;
+} {
+  switch (state) {
+    case "connected":
+      return { label: "Connected", tone: "ok" };
+    case "needs_reconnect":
+      return { label: "Not connected", tone: "warn" };
+    case "unavailable":
+      return { label: "Unavailable", tone: "bad" };
+    case null:
+    case undefined:
+      return { label: "Not checked yet", tone: "plain" };
+    default:
+      return { label: humanStatus(state), tone: statusTone(state) };
   }
 }
 
@@ -340,19 +366,18 @@ export function ConnectorsView({ token }: { token: string | null }) {
           {rows.map((row) => {
             const status = live[row.name];
             const state = status?.state ?? row.state;
+            const chip = connectionChip(state);
+            // The server's connect URL comes back with the
+            // live status check — it is the only way to link
+            // an account from here. Shown whenever the
+            // connector is not already connected.
+            const connectUrl = state === "connected" ? undefined : status?.connect_url;
             return (
               <li key={row.name} className="connector-card">
                 <div className="connector-card-head">
                   <h3>{row.name}</h3>
                   <span className="connector-chips">
-                    <StatusChip tone={row.enabled ? "ok" : "plain"}>
-                      {row.enabled ? "On" : "Off"}
-                    </StatusChip>
-                    {state && (
-                      <StatusChip tone={statusTone(state)}>
-                        {humanStatus(state)}
-                      </StatusChip>
-                    )}
+                    <StatusChip tone={chip.tone}>{chip.label}</StatusChip>
                   </span>
                 </div>
                 <p className="connector-state">{stateLine(row, status)}</p>
@@ -372,17 +397,49 @@ export function ConnectorsView({ token }: { token: string | null }) {
                     onRetry={() => void checkLive(row.name)}
                   />
                 )}
-                {status?.state === "needs_reconnect" && status.connect_url && (
-                  <p role="alert" className="warning connector-reconnect">
-                    The Google grant expired or was revoked.{" "}
-                    <a href={status.connect_url} target="_blank" rel="noreferrer">
-                      Reconnect
+                {connectUrl ? (
+                  <p className="connector-connect">
+                    {state === "needs_reconnect"
+                      ? "The Google grant expired or was revoked. "
+                      : state === "unavailable"
+                        ? "The check couldn't reach it — try connecting again. "
+                        : "This account isn't linked yet. "}
+                    <a className="btn btn-primary" href={connectUrl} target="_blank" rel="noreferrer">
+                      Connect
                     </a>
                   </p>
-                )}
+                ) : state !== "connected" ? (
+                  <p className="muted connector-connect-hint">
+                    Check the live status to get a Connect link for this account.
+                  </p>
+                ) : null}
                 {status?.error && (
                   <HumanError title="The live check failed" detail={status.error} />
                 )}
+                {/* The enabled switch is a SEPARATE control
+                  * from the connection above: it only stops
+                  * Eclipse using the connector, it is not a
+                  * connection and never revokes the grant. */}
+                <label className="check-row connector-enabled-row">
+                  <input
+                    type="checkbox"
+                    className="toggle"
+                    checked={row.enabled}
+                    disabled={pending !== null}
+                    onChange={(e) => {
+                      if (e.target.checked) void setEnabled(row.name, true);
+                      else setDisableName(row.name);
+                    }}
+                    aria-label={`Use ${row.name}`}
+                  />
+                  <span>
+                    Use this connector — {row.enabled ? "On" : "Off"}
+                  </span>
+                </label>
+                <p className="muted connector-enabled-help">
+                  Off only stops Eclipse using it; the Google grant stays
+                  until revoked in the platform Settings.
+                </p>
                 <div className="task-actions connector-actions">
                   <button
                     type="button"
@@ -391,23 +448,6 @@ export function ConnectorsView({ token }: { token: string | null }) {
                   >
                     {pending === `status:${row.name}` ? "Checking…" : "Check live status"}
                   </button>
-                  {row.enabled ? (
-                    <button
-                      type="button"
-                      onClick={() => setDisableName(row.name)}
-                      disabled={pending !== null}
-                    >
-                      Turn off
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => void setEnabled(row.name, true)}
-                      disabled={pending !== null}
-                    >
-                      {pending === `enable:${row.name}` ? "Turning on…" : "Turn on"}
-                    </button>
-                  )}
                 </div>
                 <RawData label="Details" data={row} />
               </li>

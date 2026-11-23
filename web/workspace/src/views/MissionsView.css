@@ -238,3 +238,61 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- Jobs & Mail status (PR #7) ---------- */
+
+/* Status sections are read-only: the Jobs and Mail views are
+ * gone, so their status lives here. Draft rows mirror the old
+ * Mail view's summary-first rows (recipient, subject, time,
+ * status chip). */
+.status-draft-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.status-draft-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.status-draft-recipient {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.status-draft-subject {
+  overflow-wrap: anywhere;
+  line-height: var(--lh-body);
+}
+
+.status-draft-meta {
+  font-size: var(--text-sm);
+}
+
+/* Send log: activity rows, divided (moved from the deleted
+ * MailView.css, re-scoped). */
+.missions-view .mail-log-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.missions-view .mail-log-list li {
+  border-bottom: 1px solid var(--border);
+}
+
+.missions-view .mail-log-list li:last-child {
+  border-bottom: none;
+}
+
+.missions-view .mail-log-list .activity-line p {
+  margin: 0;
+}

@@ -17,7 +17,7 @@
   "private": true,
   "scripts": {
     "build": "esbuild src/offscreen.ts src/content.ts src/background.ts src/popup.ts --bundle --format=esm --outdir=dist --sourcemap && mkdir -p dist/ort-wasm && cp node_modules/onnxruntime-web/dist/*.wasm dist/ort-wasm/ 2>/dev/null || true",
-    "pretest": "rm -rf tests-dist && esbuild src/vision/*.ts src/executor.ts src/vault.ts src/execute-options.ts src/monitor.ts src/notifications.ts src/background.ts src/popup.ts src/missions.ts --outdir=tests-dist --format=esm --log-level=warning",
+    "pretest": "rm -rf tests-dist && esbuild src/vision/*.ts src/executor.ts src/vault.ts src/execute-options.ts src/monitor.ts src/notifications.ts src/background.ts src/popup.ts src/missions.ts src/realtime.ts --outdir=tests-dist --format=esm --log-level=warning",
     "test": "node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },

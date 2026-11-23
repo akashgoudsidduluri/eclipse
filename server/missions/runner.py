@@ -991,8 +991,9 @@ def run_mission(conn, mission: dict, call_fn=None,
             candidates = discovery.discover(conn, mission, gmail=gmail)
         except Exception as exc:  # noqa: BLE001 - transient failure, retry next tick
             raise _RunFailed(f"discovery failed: {exc}") from exc
-        if (mission["type"] == "job_hunt"
-                and "gmail" in (config.get("sources") or [])
+        if (((mission["type"] == "job_hunt"
+                and "gmail" in (config.get("sources") or []))
+                or mission["type"] == "email_monitor")
                 and not discovery.gmail_available(conn)):
             notes.append(
                 "gmail_off: Gmail connector is off — offer-mail"
@@ -1047,6 +1048,13 @@ def run_mission(conn, mission: dict, call_fn=None,
                 _task_id, outcome = _act_price_watch(
                     conn, mission, candidates, run_id, notes)
                 actions.extend(outcome.get("actions", []))
+            elif mission["type"] == "email_monitor":
+                # PR #7: monitoring only — matches are recorded
+                # (discovered/matched activity + facts above);
+                # no task is spawned, nothing is applied or sent.
+                notes.append(
+                    "inbox watch: matches recorded, no actions taken"
+                )
             if _fresh_status(conn, mission_id) == "active":
                 _auto_approve_sweep(conn, mission, run_id, notes, actions)
                 _send_approved_drafts(conn, mission, run_id, notes, actions)

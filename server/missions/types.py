@@ -43,6 +43,7 @@ from urllib.parse import urlparse
 # for its actions, but no router/DB/UI change.
 from .discovery import (  # noqa: E402
     discover_cold_mail,
+    discover_email_monitor,
     discover_job_hunt,
     discover_price_watch,
 )
@@ -386,6 +387,25 @@ MISSION_TYPES: dict[str, MissionTypeSpec] = {
         }),
         default_bounds=_cold_mail_bounds(),
         discover=discover_cold_mail,
+    ),
+    # PR #7: email monitoring — "watch my inbox for interview
+    # mails". Read-only: discovery finds matching offer /
+    # interview mail via the Gmail connector and records it
+    # (activity + facts + briefing); the runner takes NO action
+    # for this type (no task, no apply, no send).
+    "email_monitor": MissionTypeSpec(
+        type="email_monitor",
+        label="Inbox watch",
+        config_schema=_schema({
+            "keywords": {
+                "type": "string_list", "required": False,
+                "default": ["interview", "offer", "shortlisted",
+                            "selected"],
+                "description": "Mail matches when its subject or body contains one of these words.",
+            },
+        }),
+        default_bounds=_base_bounds(),
+        discover=discover_email_monitor,
     ),
     "price_watch": MissionTypeSpec(
         type="price_watch",

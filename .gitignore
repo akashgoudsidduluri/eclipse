@@ -1,4 +1,8 @@
 # Eclipse local-only files — never committed
+# PR #7: model keys live in .env (see .env.example for the
+# placeholder template, which IS committed). A real .env must
+# never reach the repo.
+.env
 data/*
 !data/.gitkeep
 .venv/

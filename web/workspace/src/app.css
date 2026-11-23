@@ -12,6 +12,11 @@
   display: flex;
   flex-direction: column;
   min-height: 100%;
+  /* PR #7: the sidebar pins below the topbar (see .sidebar).
+   * The topbar's height varies with viewport width, so App
+   * measures it and overwrites this variable — the value here
+   * is only the fallback until the first measurement lands. */
+  --topbar-height: 57px;
 }
 
 /* ---------- Top bar ---------- */
@@ -143,15 +148,47 @@
 .shell {
   flex: 1;
   display: flex;
+  /* PR #7: the statusbar is a full-width second row inside
+   * the shell (see App.tsx) — the sticky sidebar's range
+   * ends at the shell's CONTENT bottom, so the footer must
+   * live inside the shell or the sidebar lifts by the
+   * footer's height at max scroll and the top nav item
+   * slides under the topbar (found in live verification,
+   * 2026-11-23: the Agent row was 2/3 hidden at the bottom
+   * of a thread; padding-bottom does NOT extend the sticky
+   * range — the constraint uses the content box). */
+  flex-wrap: wrap;
   min-height: 0;
   /* PR #6 motion: above the fixed MotionBackground layer. */
   position: relative;
   z-index: 1;
 }
 
+/* The statusbar wraps to its own full-width row below the
+ * sidebar + content row. */
+.shell > .statusbar {
+  flex: 1 0 100%;
+}
+
 .sidebar {
   width: var(--sidebar-width);
   flex-shrink: 0;
+  /* PR #7: the sidebar is PINNED — it stays fixed while the
+   * content scrolls (Prateek: it used to scroll away as the
+   * chat grew). The page itself still scrolls (the Agent
+   * chat's auto-scroll reads window.scrollY), so the sidebar
+   * is sticky, not fixed: it stops exactly below the sticky
+   * topbar, whose real height App measures into
+   * --topbar-height. Its height is the viewport below the
+   * topbar, so the frosted background and the hairline run
+   * full-height and the collapse button sits at the bottom
+   * (margin-top: auto); a nav list taller than the viewport
+   * scrolls inside it (overflow-y). */
+  position: sticky;
+  top: var(--topbar-height);
+  align-self: flex-start;
+  height: calc(100dvh - var(--topbar-height));
+  overflow-y: auto;
   /* Muse-style, Prateek 2026-11-23: the sidebar RECEDES. It
    * is the page background, not a panel of its own — one
    * hairline separates it from the content, and the content is

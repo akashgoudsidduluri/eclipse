@@ -1,6 +1,7 @@
-"""Mission intake (PR #5, §3.3): one chat message -> a mission
-draft, for the user to confirm before anything is created. The
-intake endpoint never creates a mission.
+"""Mission intake (PR #5, §3.3; extended PR #7): one chat
+message -> a mission draft, for the user to confirm before
+anything is created. The intake endpoint never creates a
+mission.
 
 Two paths, always labelled:
 - planner: the message (PII-redacted FIRST — see below) goes to
@@ -11,6 +12,17 @@ Two paths, always labelled:
   Used when the planner fails (PlannerError), returns invalid
   JSON, or returns a draft that fails validation. Source
   "rules", and the warnings say why.
+
+PR #7: chat is the ONE interface for setting missions up, so
+the intake handles ALL mission types from a plain chat message
+— job_hunt, cold_mail, price_watch, and email_monitor ("watch
+my inbox for interview mails"). A resume uploaded in chat
+(upload_ids) enriches the draft locally: locations / stipend
+from the resume fill a job hunt, attach_resume turns on for a
+cold mail, and the resume's profile facts come back as
+PROPOSED facts for the user to confirm in chat before anything
+is stored. The planner path never sees resume text — only the
+redacted message; enrichment is local-only, after the draft.
 
 PII: the planner path redacts the message with the server-side
 second PII scan (server/planner/scan.py) BEFORE the prompt is
@@ -24,12 +36,19 @@ parse_intake returns:
   {"draft": {"type", "name", "config", "bounds"},
    "source": "planner" | "rules",
    "confidence": "high" | "low",
-   "missing_fields": [...], "warnings": [...]}
+   "missing_fields": [...], "warnings": [...],
+   "clarifying_question": <str | None>,
+   "draft_card": <plain-language summary for chat>,
+   "proposed_facts": [...], "upload_ids": [...]}
 `missing_fields` names config/bounds fields the message did not
 say enough to fill — the UI prompts for them. The draft's
 config may hold None for a missing required field (validated
 with validate_config_draft); create-time validation still
-requires it.
+requires it. `clarifying_question` is at most ONE question, and
+only when the intake is genuinely blocked on something the
+user can answer in chat (a product URL, a recipient address, a
+target price) — a CSS selector is never asked for in chat, it
+stays a missing field for the page picker.
 """
 from __future__ import annotations
 
@@ -38,8 +57,10 @@ import logging
 import re
 from urllib.parse import urlparse
 
+from ..jobs import profile as profile_mod
 from ..planner import prompts, router, scan
 from . import types as _types
+from . import uploads as uploads_mod
 
 logger = logging.getLogger("eclipse.missions")
 
@@ -85,23 +106,51 @@ _KNOWN_LOCATIONS = (
 )
 
 # Keyword sets for the rule path. A word match scores 1; the
-# type with the highest score wins (ties break toward job_hunt,
-# the default — a vague message is more likely a job hunt than
-# a price watch, and the user corrects the draft anyway).
+# type with the highest score wins (ties break toward the most
+# specific signal — see _pick_type; a message with no signal at
+# all defaults to job_hunt, and the user corrects the draft
+# anyway).
+# email_monitor deliberately has NO bare "mail"/"email" keyword
+# — those belong to cold_mail; inbox monitoring is signalled by
+# "inbox" and by mail phrases ("interview mail", "offer mail").
 _TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "price_watch": (
-        "price", "watch", "drop", "deal", "discount", "cost",
-        "cheaper", "sale", "amazon", "flipkart", "below",
+        "price", "prices", "watch", "drop", "deal", "discount",
+        "cost", "cheaper", "sale", "amazon", "flipkart", "below",
     ),
     "cold_mail": (
-        "mail", "email", "cold", "recruiter", "reach out",
-        "write to", "contact", "send a mail", "send an email",
+        "mail", "mails", "email", "emails", "cold", "recruiter",
+        "reach out", "write to", "contact", "send a mail",
+        "send an email",
     ),
     "job_hunt": (
-        "job", "role", "intern", "apply", "hunt", "sde",
-        "developer", "engineer", "opening", "hiring", "vacancy",
-        "interview",
+        "job", "jobs", "role", "roles", "intern", "apply",
+        "applying", "hunt", "sde", "developer", "engineer",
+        "opening", "hiring", "vacancy", "interview",
     ),
+    "email_monitor": (
+        "inbox", "monitor", "monitoring", "alert", "notify",
+        "interview mail", "interview mails", "offer mail",
+        "offer mails", "watch my inbox", "check my inbox",
+    ),
+}
+
+# Keywords an email_monitor draft watches for, when the
+# message names them (otherwise the type default applies).
+_EMAIL_MONITOR_KEYWORDS = (
+    "interview", "offer", "shortlisted", "selected",
+    "application", "rejection", "onboarding", "hr",
+)
+
+# Missing fields the user CAN answer in chat, in the order
+# they are asked — at most ONE clarifying question per intake.
+# A CSS selector is never in this map: it is not answerable in
+# chat (the user picks it from the page), so it stays a missing
+# field and never blocks the draft card.
+_CLARIFYING_QUESTIONS: dict[str, str] = {
+    "url": "Which product page should I watch? Paste the link.",
+    "recipients": "Who should I mail? Give me the email addresses.",
+    "target_price": "Below what price should I tell you?",
 }
 
 
@@ -114,6 +163,16 @@ def _score_types(text: str) -> dict[str, int]:
     scores = {}
     for mission_type, words in _TYPE_KEYWORDS.items():
         scores[mission_type] = sum(_word_count(lowered, w) for w in words)
+    # "monitor" is a generic continuous verb, not an inbox
+    # signal: "monitor the price" is a price watch, not an
+    # inbox watch. It only counts for email_monitor when an
+    # inbox/mail word is present too ("monitor my inbox",
+    # "monitor my email" still count).
+    if not re.search(r"\b(inbox|mail|mails|email|emails)\b", lowered):
+        scores["email_monitor"] -= (
+            _word_count(lowered, "monitor")
+            + _word_count(lowered, "monitoring")
+        )
     # A URL plus any price word is decisive for a price watch;
     # an email address plus any mail word is decisive for cold
     # mail. Without the companion signal, a bare URL or address
@@ -122,6 +181,10 @@ def _score_types(text: str) -> dict[str, int]:
         scores["price_watch"] += 3
     if _EMAIL_RE.search(text) and scores["cold_mail"] > 0:
         scores["cold_mail"] += 3
+    # "inbox" is unambiguous — watching an inbox is never a
+    # price watch or a job hunt.
+    if re.search(r"\binbox\b", text, re.IGNORECASE):
+        scores["email_monitor"] += 3
     return scores
 
 
@@ -130,10 +193,48 @@ def _pick_type(text: str) -> tuple[str, dict[str, int]]:
     best = max(scores.values())
     if best == 0:
         return "job_hunt", scores
-    for mission_type in ("price_watch", "cold_mail", "job_hunt"):
+    # Tie order: the most specific signal wins — an inbox
+    # mention beats a generic "watch", a price beats a mail.
+    for mission_type in ("email_monitor", "price_watch",
+                         "cold_mail", "job_hunt"):
         if scores[mission_type] == best:
             return mission_type, scores
     return "job_hunt", scores
+
+
+# Continuous-language markers: the difference between a
+# one-off task ("find me a job") and a standing mission
+# ("keep applying for jobs"). A bare "watch" is NOT a marker —
+# "watch this video" is a task, not a price watch; "watch my
+# inbox" and "watch the price" are specific enough to count.
+_CONTINUOUS_MARKERS = (
+    "keep", "continuously", "continuous", "always", "every day",
+    "daily", "whenever", "alert", "notify", "tell me when",
+    "let me know when", "monitor", "track", "keep an eye",
+    "regularly", "on repeat", "ongoing", "each day",
+    "every morning", "watch my inbox", "check my inbox",
+    "watch the price", "watch for",
+)
+
+
+def is_mission_request(message: str) -> bool:
+    """A standing-mission ask, not a one-off task: continuous
+    language AND a mission-type signal. Both halves are
+    required — "keep this tab open" has the language but no
+    type signal, and "find me a job" has the signal but no
+    continuous language. Pure; the chat router uses it so a
+    plain chat message ("watch my inbox for interview mails")
+    drafts a mission instead of becoming a dead one-off task."""
+    if not isinstance(message, str) or not message.strip():
+        return False
+    lowered = message.lower()
+    continuous = any(
+        re.search(rf"\b{re.escape(marker)}\b", lowered)
+        for marker in _CONTINUOUS_MARKERS
+    )
+    if not continuous:
+        return False
+    return max(_score_types(message).values()) > 0
 
 
 def _money_value(match) -> int | None:
@@ -178,6 +279,11 @@ def _draft_name(mission_type: str, config: dict) -> str:
             noun = "recipient" if len(recipients) == 1 else "recipients"
             return f"Cold mail — {len(recipients)} {noun}"
         return "Cold mail"
+    if mission_type == "email_monitor":
+        keywords = config.get("keywords") or []
+        if keywords:
+            return f"Inbox watch — {', '.join(keywords[:2])}"
+        return "Inbox watch"
     url = config.get("url") or ""
     try:
         host = urlparse(url).netloc or ""
@@ -223,6 +329,16 @@ def _rules_draft(message: str) -> dict:
         missing.append("roles")
         if re.search(r"\b(resume|cv)\b", message, re.IGNORECASE):
             config["attach_resume"] = True
+    elif mission_type == "email_monitor":
+        # Keywords the message names ("interview", "offer");
+        # when it names none, the type default applies
+        # (validate_config_draft fills it) — nothing is missing.
+        named = [
+            kw for kw in _EMAIL_MONITOR_KEYWORDS
+            if re.search(rf"\b{re.escape(kw)}\b", message, re.IGNORECASE)
+        ]
+        if named:
+            config["keywords"] = named
     else:  # job_hunt
         locations = _extract_locations(message)
         if locations:
@@ -343,13 +459,181 @@ def _planner_draft(message: str, call_fn) -> dict:
     }
 
 
-def parse_intake(message: str, call_fn=None) -> dict:
+def _clarifying_question(missing: list[str]) -> str | None:
+    """At most ONE question, only when the intake is genuinely
+    blocked on something the user can answer in chat. The
+    priority order (url, recipients, target_price) is the order
+    a mission needs them; a selector is never asked (see the
+    map's comment)."""
+    for field in ("url", "recipients", "target_price"):
+        if field in missing and field in _CLARIFYING_QUESTIONS:
+            return _CLARIFYING_QUESTIONS[field]
+    return None
+
+
+def _format_facts_line(proposed_facts: list[dict]) -> str:
+    """One plain line summarising the proposed resume facts
+    ("Name — Python, FastAPI; Hyderabad"), or ""."""
+    parts = []
+    for fact in proposed_facts or []:
+        value = fact.get("value")
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        parts.append(f"{fact.get('label', fact.get('field'))}: {value}")
+    return "; ".join(parts)
+
+
+def _draft_card(draft: dict, missing: list[str],
+                proposed_facts: list[dict]) -> str:
+    """The draft as plain language for the chat thread — what
+    the mission will do, its limits, and what is still needed.
+    No jargon, no config keys."""
+    mission_type = draft["type"]
+    config = draft.get("config") or {}
+    bounds = draft.get("bounds") or {}
+    lines = []
+    if mission_type == "job_hunt":
+        text = "I'll keep looking for roles"
+        locations = config.get("locations") or []
+        if locations:
+            text += f" in {', '.join(locations)}"
+        stipend = config.get("stipend_min")
+        if stipend:
+            text += f", minimum stipend ₹{stipend:,} a month"
+        cap = bounds.get("max_applies_per_day", 3)
+        text += f", and apply to at most {cap} a day."
+        if bounds.get("auto_approve"):
+            text += " Applications go ahead on their own once they fit."
+        else:
+            text += " I'll ask you before each application."
+        lines.append(text)
+    elif mission_type == "cold_mail":
+        recipients = config.get("recipients") or []
+        count = len(recipients)
+        noun = "person" if count == 1 else "people"
+        text = f"I'll draft cold mails to {count} {noun}" if count else \
+            "I'll draft cold mails"
+        cap = bounds.get("max_sends_per_day", 5)
+        text += f" and send at most {cap} a day."
+        if config.get("attach_resume"):
+            text += " Your resume goes with each mail."
+        if not bounds.get("auto_approve"):
+            text += " I'll ask you before each send."
+        lines.append(text)
+    elif mission_type == "price_watch":
+        url = config.get("url") or "that product page"
+        text = f"I'll watch {url}"
+        target = config.get("target_price")
+        if target is not None:
+            text += f" and tell you when the price drops below ₹{target:,}."
+        else:
+            text += " and tell you when the price changes."
+        lines.append(text)
+        if "selector" in missing:
+            lines.append(
+                "I'll need you to point at the price on the page"
+                " the first time it runs."
+            )
+    elif mission_type == "email_monitor":
+        keywords = config.get("keywords") or []
+        if keywords:
+            text = (
+                "I'll watch your inbox for mails about"
+                f" {', '.join(keywords)} and tell you about them"
+                " in the morning briefing."
+            )
+        else:
+            text = (
+                "I'll watch your inbox for interview and offer"
+                " mails and tell you about them in the morning"
+                " briefing."
+            )
+        lines.append(text)
+    if missing:
+        lines.append(f"Still needed: {', '.join(missing)}.")
+    facts_line = _format_facts_line(proposed_facts)
+    if facts_line:
+        lines.append(
+            f"From your resume: {facts_line}. Say yes and I'll"
+            " save these as your profile."
+        )
+    return " ".join(lines)
+
+
+def _enrich_with_resume(result: dict, message: str,
+                        resume_text: str | None,
+                        proposed_facts: list[dict],
+                        upload_ids: list[str]) -> dict:
+    """Fold resume context into an intake result (planner or
+    rules — the enrichment is local-only either way). A job
+    hunt takes locations / stipend from the resume when the
+    message did not say them; a cold mail attaches the resume
+    when one was uploaded; a job hunt with target roles in the
+    resume gets them in its name. Fields the resume fills leave
+    missing_fields. The result gains proposed_facts, upload_ids,
+    the (at most one) clarifying question, and the draft card."""
+    draft = result["draft"]
+    mission_type = draft["type"]
+    config = draft.get("config") or {}
+    missing = list(result.get("missing_fields") or [])
+    profile = None
+    if resume_text:
+        profile = profile_mod.parse_resume(resume_text)
+    if profile is not None:
+        if mission_type == "job_hunt":
+            if not config.get("locations") and profile.get("locations"):
+                config["locations"] = list(profile["locations"])
+                if "locations" in missing:
+                    missing.remove("locations")
+            if (config.get("stipend_min") is None
+                    and profile.get("stipend_min") is not None):
+                config["stipend_min"] = profile["stipend_min"]
+                if "stipend_min" in missing:
+                    missing.remove("stipend_min")
+        if mission_type == "cold_mail" and upload_ids:
+            config["attach_resume"] = True
+    if mission_type == "job_hunt" and result.get("source") == "rules":
+        targets = next(
+            (f.get("value") for f in proposed_facts
+             if f.get("field") == "target_roles"),
+            None,
+        )
+        if targets and draft.get("name") in ("Job hunt", None):
+            draft["name"] = f"Job hunt — {targets[0]}"
+        elif profile is not None and config.get("locations") \
+                and draft.get("name") == "Job hunt":
+            draft["name"] = _draft_name(mission_type, config)
+    # A rules draft that was low-confidence only because fields
+    # were missing is high-confidence once the resume fills them.
+    if (result.get("source") == "rules" and not missing
+            and result.get("confidence") == "low"):
+        _picked, scores = _pick_type(message)
+        ordered = sorted(scores.values(), reverse=True)
+        if ordered[0] >= 2 and ordered[0] > ordered[1]:
+            result["confidence"] = "high"
+    result["missing_fields"] = missing
+    result["proposed_facts"] = proposed_facts
+    result["upload_ids"] = list(upload_ids)
+    result["clarifying_question"] = _clarifying_question(missing)
+    result["draft_card"] = _draft_card(draft, missing, proposed_facts)
+    return result
+
+
+def parse_intake(message: str, call_fn=None, resume_text: str | None = None,
+                 upload_ids: list[str] | None = None,
+                 conn=None) -> dict:
     """Parse one chat message into a mission draft.
 
     Planner first (redacted), rules on any planner failure —
     labelled, never a mock planner, never an exception for a
     planner failure. Raises ValueError only for an empty or
-    oversized message (the API maps it to 422)."""
+    oversized message (the API maps it to 422).
+
+    Resume context (PR #7): pass `resume_text` directly, or
+    `upload_ids` + a DB `conn` to load the extracted text of
+    chat uploads. The resume NEVER reaches the planner — it
+    only enriches the draft locally afterwards (see
+    _enrich_with_resume)."""
     if not isinstance(message, str) or not message.strip():
         raise ValueError("message must not be empty")
     if len(message) > MAX_MESSAGE_LEN:
@@ -357,9 +641,19 @@ def parse_intake(message: str, call_fn=None) -> dict:
             f"message must be at most {MAX_MESSAGE_LEN} characters"
         )
     message = message.strip()
+    upload_ids = list(upload_ids or [])
+    proposed_facts: list[dict] = []
+    if conn is not None and upload_ids:
+        if resume_text is None:
+            resume_text = uploads_mod.resume_text_for_uploads(
+                conn, upload_ids)
+        proposed_facts = uploads_mod.proposed_facts_for_uploads(
+            conn, upload_ids)
+    elif resume_text:
+        proposed_facts = uploads_mod.derive_proposed_facts(resume_text)
     call_fn = call_fn or router.call_planner
     try:
-        return _planner_draft(message, call_fn)
+        result = _planner_draft(message, call_fn)
     except Exception as exc:  # noqa: BLE001 - any planner failure falls back to rules
         logger.info("intake planner path failed (%s); using rules", exc)
         result = _rules_draft(message)
@@ -367,4 +661,5 @@ def parse_intake(message: str, call_fn=None) -> dict:
             "The planner could not draft this mission, so rules"
             " were used instead — check the draft before creating it."
         ] + result["warnings"]
-        return result
+    return _enrich_with_resume(result, message, resume_text,
+                               proposed_facts, upload_ids)

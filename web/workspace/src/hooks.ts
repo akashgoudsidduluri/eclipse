@@ -72,6 +72,16 @@ export function newApprovalId(): string {
   return `appr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** PR #7: bytes → "842 B" / "12 KB" / "2.4 MB" for the chat
+ * file chips. Pure — covered by tests/format.test.mjs. */
+export function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  const mb = bytes / (1024 * 1024);
+  return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`;
+}
+
 /** Unix seconds → short local time, or "—" for null. */
 export function fmtTime(ts: number | null | undefined): string {
   if (ts === null || ts === undefined) return "—";

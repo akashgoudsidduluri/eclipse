@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import {
   api,
   type ChatMessage,
+  type ChatUpload,
+  type IntakeResponse,
   type PendingApproval,
   type Step,
   type TaskDetail,
@@ -9,6 +11,7 @@ import {
 } from "../api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { EclipseHero } from "../components/EclipseHero";
+import { formatFileSize } from "../hooks";
 import {
   ApprovalBanner,
   Disclosure,
@@ -148,6 +151,202 @@ function ShieldIcon() {
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 3 5 6v5c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6l-7-3Z" />
     </svg>
+  );
+}
+
+/** PR #7: the paperclip for the composer's attach button. */
+function PaperclipIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
+  );
+}
+
+/** PR #7: a file glyph for attachment chips. */
+function FileIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <path d="M14 2v6h6" />
+    </svg>
+  );
+}
+
+/** PR #7: the files attached to a chat message, as quiet
+ * chips under the bubble (name + size + what happened to the
+ * text inside). */
+function AttachmentChips({ uploads }: { uploads: ChatUpload[] }) {
+  if (uploads.length === 0) return null;
+  return (
+    <ul className="chat-attachments" aria-label="Attached files">
+      {uploads.map((u) => (
+        <li key={u.id} className="chat-file-chip">
+          <FileIcon />
+          <span className="chat-file-name">{u.filename}</span>
+          <span className="muted">{formatFileSize(u.size_bytes)}</span>
+          {u.extraction_status === "ok" ? (
+            <span className="chat-file-ok">text read</span>
+          ) : u.extraction_status === "limited" ? (
+            <span className="muted">little text found</span>
+          ) : (
+            <span className="muted">kept as-is</span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** PR #7: the mission draft card — the plain-language draft
+ * from the intake, the proposed resume facts, and the
+ * confirm step. Nothing is created until the user picks one
+ * of the two create buttons; "Create & start" also activates
+ * the mission, "Create" leaves it as a draft. Confirming
+ * also saves the proposed resume facts as the profile (the
+ * card shows them, so the confirm covers both). A price
+ * watch needs its selector: the card offers a small input
+ * for it (a CSS selector, or text: followed by the price
+ * words) instead of blocking the whole flow. */
+function DraftCard({
+  intake,
+  uploads,
+  onDone,
+  onCancel,
+}: {
+  intake: IntakeResponse;
+  uploads: ChatUpload[];
+  onDone: (message: string) => void;
+  onCancel: () => void;
+}) {
+  const [selector, setSelector] = useState("");
+  const [busy, setBusy] = useState<"create" | "start" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const missing = intake.missing_fields ?? [];
+  const needsSelector = missing.includes("selector");
+  // A draft blocked on something the user must still answer
+  // (a URL, recipients) cannot be created yet — the
+  // clarifying question already asked for it.
+  const blocked = missing.some((f) => f === "url" || f === "recipients");
+  const canCreate = !blocked && (!needsSelector || selector.trim().length > 0);
+  const facts = intake.proposed_facts ?? [];
+  const resumeText = uploads
+    .map((u) => u.extracted_text)
+    .filter((t): t is string => Boolean(t))
+    .join("\n\n");
+
+  const create = async (activate: boolean) => {
+    setBusy(activate ? "start" : "create");
+    setError(null);
+    try {
+      const config: Record<string, unknown> = {
+        ...intake.draft.config,
+      };
+      if (needsSelector) config.selector = selector.trim();
+      const mission = await api.createMission({
+        type: intake.draft.type,
+        name: intake.draft.name,
+        config,
+        bounds: intake.draft.bounds,
+        upload_ids: intake.upload_ids ?? [],
+      });
+      if (facts.length > 0 && resumeText) {
+        // The user confirmed the card, which shows these
+        // facts — save them as the profile now.
+        await api.setProfile(resumeText);
+      }
+      if (activate) {
+        await api.activateMission(mission.id);
+        onDone(
+          `Done — "${mission.name}" is created and running. It will show up in Missions, and in your 9 AM briefing.`,
+        );
+      } else {
+        onDone(
+          `Done — "${mission.name}" is created as a draft. Start it from Missions whenever you're ready.`,
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="chat-draft-card" role="group" aria-label="Mission draft">
+      <h4>{intake.draft.name}</h4>
+      <p>{intake.draft_card ?? "Here's the mission as I understood it."}</p>
+      {facts.length > 0 && (
+        <div className="chat-draft-facts">
+          <span className="muted">From your resume — saved as your profile when you confirm:</span>
+          <ul>
+            {facts.map((f) => (
+              <li key={f.field}>
+                <strong>{f.label}:</strong>{" "}
+                {Array.isArray(f.value) ? f.value.join(", ") : String(f.value)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {missing.length > 0 && (
+        <p className="muted">
+          Still needed: {missing.join(", ")}.
+        </p>
+      )}
+      {intake.warnings.length > 0 && (
+        <p className="muted">{intake.warnings[0]}</p>
+      )}
+      {needsSelector && (
+        <label className="chat-draft-selector">
+          <span>Which part of the page shows the price?</span>
+          <input
+            type="text"
+            value={selector}
+            onChange={(e) => setSelector(e.target.value)}
+            placeholder="CSS selector, or text:₹4,999"
+            disabled={busy !== null}
+          />
+          <span className="muted">
+            A CSS selector like .price, or text: followed by words near the price.
+          </span>
+        </label>
+      )}
+      <div className="chat-draft-actions">
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => void create(true)}
+          disabled={!canCreate || busy !== null}
+        >
+          {busy === "start" ? "Starting…" : "Create & start"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          onClick={() => void create(false)}
+          disabled={!canCreate || busy !== null}
+        >
+          {busy === "create" ? "Creating…" : "Create as draft"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          onClick={onCancel}
+          disabled={busy !== null}
+        >
+          Cancel
+        </button>
+      </div>
+      {blocked && (
+        <p className="muted">
+          This draft still needs {missing.join(" and ")} — answer the question above first.
+        </p>
+      )}
+      {error && (
+        <HumanError title="Couldn't create that mission" detail={error} />
+      )}
+    </div>
   );
 }
 
@@ -693,13 +892,24 @@ function TaskCard({
   );
 }
 
+/** One file waiting to be sent with the next message. */
+type AttachedFile = {
+  file: File;
+  key: string;
+};
+
 /** The composer, shared by the hero and the thread layouts —
  * same input, same send behaviour, same IDs (chat-input,
  * chat-send). Only one instance is mounted at a time. The
  * textarea grows to ~5 lines; Enter sends, Shift+Enter is a
  * newline. It is disabled only while a reply POST is in
  * flight — never while a task runs, so steering ("stop",
- * "remote only") always works. */
+ * "remote only") always works.
+ *
+ * PR #7: a paperclip button attaches files (resume, text,
+ * images — 10 MB each). Attached files show as chips above
+ * the input with a remove button; while they upload, the
+ * chip shows a progress bar and send waits for the upload. */
 function ChatComposer({
   draft,
   onDraft,
@@ -707,6 +917,10 @@ function ChatComposer({
   onSend,
   inputRef,
   pinned,
+  attached,
+  onAttach,
+  onRemove,
+  uploadProgress,
 }: {
   draft: string;
   onDraft: (value: string) => void;
@@ -714,7 +928,16 @@ function ChatComposer({
   onSend: (text: string) => void;
   inputRef: RefObject<HTMLTextAreaElement | null>;
   pinned: boolean;
+  attached: AttachedFile[];
+  onAttach: (files: FileList) => void;
+  onRemove: (key: string) => void;
+  uploadProgress: Record<string, number>;
 }) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploading = attached.some(
+    (a) =>
+      uploadProgress[a.key] !== undefined && uploadProgress[a.key] < 100,
+  );
   // Autogrow, capped at ~5 lines (120px).
   useEffect(() => {
     const el = inputRef.current;
@@ -724,47 +947,111 @@ function ChatComposer({
   }, [draft, inputRef]);
 
   return (
-    <form
-      className={pinned ? "chat-composer chat-composer-pinned" : "chat-composer"}
-      onSubmit={(e) => {
-        e.preventDefault();
-        onSend(draft);
-      }}
+    <div
+      className={
+        pinned
+          ? "chat-composer-wrap chat-composer-pinned"
+          : "chat-composer-wrap"
+      }
     >
-      <label htmlFor="chat-input" className="chat-sr-only">
-        Message Eclipse
-      </label>
-      <textarea
-        id="chat-input"
-        ref={inputRef}
-        value={draft}
-        onChange={(e) => onDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            onSend(draft);
-          }
+      {attached.length > 0 && (
+        <ul className="chat-attach-chips" aria-label="Files to send">
+          {attached.map(({ file, key }) => {
+            const pct = uploadProgress[key];
+            return (
+              <li key={key} className="chat-file-chip">
+                <FileIcon />
+                <span className="chat-file-name">{file.name}</span>
+                <span className="muted">{formatFileSize(file.size)}</span>
+                {pct !== undefined && pct < 100 ? (
+                  <span
+                    className="chat-file-progress"
+                    role="progressbar"
+                    aria-valuenow={pct}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`Uploading ${file.name}`}
+                  >
+                    <span style={{ width: `${pct}%` }} />
+                  </span>
+                ) : null}
+                <button
+                  type="button"
+                  className="chat-file-remove"
+                  onClick={() => onRemove(key)}
+                  disabled={sending}
+                  aria-label={`Remove ${file.name}`}
+                >
+                  <XIcon />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <form
+        className="chat-composer"
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSend(draft);
         }}
-        placeholder="Ask Eclipse to do something, or just say hi"
-        rows={1}
-      />
-      <button
-        id="chat-send"
-        type="submit"
-        className={sending ? "chat-send chat-send-busy" : "chat-send"}
-        disabled={sending || !draft.trim()}
-        aria-label="Send message"
       >
-        {sending ? (
-          <Spinner />
-        ) : (
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M12 19V5" />
-            <path d="m5 12 7-7 7 7" />
-          </svg>
-        )}
-      </button>
-    </form>
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="chat-sr-only"
+          accept=".pdf,.txt,.md,.docx,.png,.jpg,.jpeg,.gif,.webp"
+          multiple
+          onChange={(e) => {
+            if (e.target.files) onAttach(e.target.files);
+            e.target.value = "";
+          }}
+        />
+        <button
+          type="button"
+          className="chat-attach"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={sending}
+          aria-label="Attach a file"
+          title="Attach a file (resume, text, image — 10 MB max)"
+        >
+          <PaperclipIcon />
+        </button>
+        <label htmlFor="chat-input" className="chat-sr-only">
+          Message Eclipse
+        </label>
+        <textarea
+          id="chat-input"
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => onDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              onSend(draft);
+            }
+          }}
+          placeholder="Ask Eclipse to do something, or just say hi"
+          rows={1}
+        />
+        <button
+          id="chat-send"
+          type="submit"
+          className={sending ? "chat-send chat-send-busy" : "chat-send"}
+          disabled={sending || uploading || !draft.trim()}
+          aria-label="Send message"
+        >
+          {sending ? (
+            <Spinner />
+          ) : (
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M12 19V5" />
+              <path d="m5 12 7-7 7 7" />
+            </svg>
+          )}
+        </button>
+      </form>
+    </div>
   );
 }
 
@@ -781,6 +1068,10 @@ export function AgentView({
   // Sources for replies received live in this session
   // (history rows may not carry one — see ChatMessage).
   const [sources, setSources] = useState<Record<string, "planner" | "rules">>({});
+  // PR #7: which provider answered each live reply
+  // ("ollama" | "antseed" | "groq" …). History rows carry
+  // provider on the message itself.
+  const [providers, setProviders] = useState<Record<string, string>>({});
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -792,6 +1083,29 @@ export function AgentView({
   const [recentTasks, setRecentTasks] = useState<TaskSummary[]>([]);
   const [shownRecent, setShownRecent] = useState(8);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // PR #7: chat uploads + mission intake from chat.
+  const [attached, setAttached] = useState<AttachedFile[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
+  // The pending mission draft card (intake result + the uploads
+  // behind it, for the profile save on confirm).
+  const [draftCard, setDraftCard] = useState<{
+    intake: IntakeResponse;
+    uploads: ChatUpload[];
+  } | null>(null);
+  // A clarifying question is outstanding: the next message
+  // answers it, and the intake runs again on the combined
+  // text. `attempts` caps the loop at one follow-up.
+  const [pendingIntake, setPendingIntake] = useState<{
+    message: string;
+    uploadIds: string[];
+    uploads: ChatUpload[];
+    attempts: number;
+  } | null>(null);
+  // Uploads per chat message id, for history rows (the thread
+  // renders file chips under messages that had attachments).
+  const [messageUploads, setMessageUploads] = useState<
+    Record<string, ChatUpload[]>
+  >({});
 
   // Auto-scroll: only when the user is already near the
   // bottom — never yank them while they read further up.
@@ -827,6 +1141,19 @@ export function AgentView({
     } finally {
       setHistoryLoading(false);
     }
+    // Uploads linked to thread messages — a failed load hides
+    // the file chips, it never breaks chat.
+    void api.listChatUploads().then(
+      (data) => {
+        const byMessage: Record<string, ChatUpload[]> = {};
+        for (const u of data.uploads) {
+          if (!u.chat_message_id) continue;
+          (byMessage[u.chat_message_id] ??= []).push(u);
+        }
+        setMessageUploads(byMessage);
+      },
+      () => setMessageUploads({}),
+    );
   };
 
   useEffect(() => {
@@ -844,16 +1171,164 @@ export function AgentView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
+  /** Attach files from the picker (10 MB each, server
+   * enforced — a bigger file fails at upload with the
+   * server's message). */
+  const attachFiles = (files: FileList) => {
+    const next: AttachedFile[] = [];
+    for (const file of Array.from(files)) {
+      next.push({ file, key: `${file.name}-${file.size}-${Date.now()}` });
+    }
+    setAttached((a) => [...a, ...next]);
+  };
+
+  const removeAttached = (key: string) => {
+    setAttached((a) => a.filter((f) => f.key !== key));
+    setUploadProgress((p) => {
+      const next = { ...p };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const appendAgentMessage = (
+    text: string,
+    source?: "planner" | "rules",
+    provider?: string | null,
+  ) => {
+    const agentMsg: ChatMessage = {
+      id: `local-${Date.now()}`,
+      role: "agent",
+      text,
+      kind: "chat",
+      task_id: null,
+      created_at: Math.floor(Date.now() / 1000),
+      source,
+      provider: provider ?? null,
+    };
+    setMessages((m) => [...m, agentMsg]);
+    if (source) {
+      setSources((s) => ({ ...s, [agentMsg.id]: source }));
+    }
+    if (provider) {
+      setProviders((p) => ({ ...p, [agentMsg.id]: provider }));
+    }
+  };
+
+  /** PR #7: send with attachments, or answer a clarifying
+   * question — the mission-intake path. Files upload first
+   * (progress on their chips), then POST /missions/intake
+   * drafts the mission from the message + the resume text.
+   * The exchange is stored in the thread (store_in_chat), so
+   * a mission set up from chat stays in the thread. A
+   * clarifying question becomes the agent's reply and the
+   * next message answers it; otherwise the draft card opens
+   * under the thread and nothing is created until the user
+   * confirms it. */
+  const sendIntake = async (
+    text: string,
+    files: AttachedFile[],
+    pending: typeof pendingIntake,
+    echo: boolean,
+  ) => {
+    const combined = pending ? `${pending.message}\n${text}` : text;
+    const priorUploads = pending?.uploads ?? [];
+    let uploads: ChatUpload[] = [...priorUploads];
+    if (echo) {
+      const userMsg: ChatMessage = {
+        id: `local-${Date.now()}`,
+        role: "user",
+        text,
+        kind: "chat",
+        task_id: null,
+        created_at: Math.floor(Date.now() / 1000),
+      };
+      setMessages((m) => [...m, userMsg]);
+    }
+    setSending(true);
+    try {
+      for (const { file, key } of files) {
+        const uploaded = await api.uploadChatFile(file, (pct) =>
+          setUploadProgress((p) => ({ ...p, [key]: pct })),
+        );
+        uploads = [...uploads, uploaded];
+      }
+      const result = await api.intakeMission(combined, {
+        uploadIds: uploads.map((u) => u.id),
+        storeInChat: true,
+      });
+      // Link the uploads to the local echo so the file chips
+      // render under the message right away (the server rows
+      // carry the same link for reloads).
+      if (uploads.length > 0) {
+        setMessages((m) => {
+          const next = [...m];
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === "user" && next[i].text === text) {
+              next[i] = { ...next[i], attachments: uploads };
+              break;
+            }
+          }
+          return next;
+        });
+        if (result.chat_message_id) {
+          setMessageUploads((mu) => ({
+            ...mu,
+            [result.chat_message_id as string]: uploads,
+          }));
+        }
+      }
+      setAttached([]);
+      setUploadProgress({});
+      setPendingIntake(null);
+      if (result.clarifying_question && (pending?.attempts ?? 0) < 1) {
+        appendAgentMessage(
+          `${result.draft_card ?? ""}\n\n${result.clarifying_question}`.trim(),
+          result.source,
+        );
+        setPendingIntake({
+          message: combined,
+          uploadIds: uploads.map((u) => u.id),
+          uploads,
+          attempts: (pending?.attempts ?? 0) + 1,
+        });
+      } else {
+        appendAgentMessage(
+          result.draft_card ?? "Here's the mission as I understood it.",
+          result.source,
+        );
+        setDraftCard({ intake: result, uploads });
+      }
+    } catch (err) {
+      setSendError({
+        detail: err instanceof Error ? err.message : String(err),
+        retryText: text,
+      });
+    } finally {
+      setSending(false);
+      window.setTimeout(() => inputRef.current?.focus(), 60);
+    }
+  };
+
   /** Send one message through POST /chat/message — the only
    * send path. `echo` adds the user's bubble; a retry
    * re-sends without duplicating it. A greeting comes back
    * kind "chat" with no task; a real request comes back kind
-   * "task_created" and its card anchors under the reply. */
+   * "task_created" and its card anchors under the reply.
+   *
+   * PR #7: a message with attached files, or one answering a
+   * clarifying question, takes the mission-intake path
+   * instead (sendIntake) — chat is the one interface for
+   * setting missions up. */
   const send = async (rawText: string, echo = true) => {
     const text = rawText.trim();
     if (!text || sending) return;
     if (echo) setDraft("");
     setSendError(null);
+    if (attached.length > 0 || pendingIntake !== null) {
+      await sendIntake(text, attached, pendingIntake, echo);
+      return;
+    }
     if (echo) {
       const userMsg: ChatMessage = {
         id: `local-${Date.now()}`,
@@ -876,9 +1351,29 @@ export function AgentView({
         task_id: res.task_id,
         created_at: Math.floor(Date.now() / 1000),
         source: res.source,
+        provider: res.provider,
       };
       setMessages((m) => [...m, agentMsg]);
       setSources((s) => ({ ...s, [res.message_id]: res.source }));
+      if (res.provider) {
+        setProviders((p) => ({ ...p, [res.message_id]: res.provider as string }));
+      }
+      // PR #7: a standing-mission ask comes back with the
+      // intake draft — open the draft card under the thread
+      // (or hold the clarifying question for the next message,
+      // which then takes the intake path via pendingIntake).
+      if (res.draft) {
+        if (res.draft.clarifying_question) {
+          setPendingIntake({
+            message: text,
+            uploadIds: [],
+            uploads: [],
+            attempts: 1,
+          });
+        } else {
+          setDraftCard({ intake: res.draft, uploads: [] });
+        }
+      }
       if (res.kind === "task_created" && res.task_id) {
         void api.listTasks().then(
           (data) => setRecentTasks(data.tasks),
@@ -939,6 +1434,10 @@ export function AgentView({
       onSend={(text) => void send(text)}
       inputRef={inputRef}
       pinned={!isEmpty}
+      attached={attached}
+      onAttach={attachFiles}
+      onRemove={removeAttached}
+      uploadProgress={uploadProgress}
     />
   );
 
@@ -1059,6 +1558,20 @@ export function AgentView({
                 m.role === "agent"
                   ? (sources[m.id] ?? m.source ?? null)
                   : null;
+              // PR #7: which model answered — "via Ollama".
+              // Null when rules answered (no "via" shown).
+              const provider =
+                m.role === "agent"
+                  ? (providers[m.id] ?? m.provider ?? null)
+                  : null;
+              const providerLabel = provider
+                ? provider.charAt(0).toUpperCase() + provider.slice(1)
+                : null;
+              // PR #7: files attached to this message — from the
+              // local echo, or matched by chat_message_id for
+              // history rows.
+              const attachments =
+                m.attachments ?? messageUploads[m.id] ?? [];
               return (
                 <div
                   key={m.id}
@@ -1069,6 +1582,7 @@ export function AgentView({
                   {m.role === "user" ? (
                     <div className="chat-bubble chat-bubble-user">
                       <p>{m.text}</p>
+                      <AttachmentChips uploads={attachments} />
                     </div>
                   ) : (
                     <div className="chat-msg">
@@ -1084,6 +1598,9 @@ export function AgentView({
                       <span className="chat-source">
                         {source === "planner" ? "Planned reply" : "Quick reply"}
                       </span>
+                    ) : null}
+                    {providerLabel ? (
+                      <span className="chat-provider">via {providerLabel}</span>
                     ) : null}
                   </div>
                   {isFirstAnchor && m.task_id ? (
@@ -1111,7 +1628,37 @@ export function AgentView({
                 onRetry={() => void send(sendError.retryText, false)}
               />
             )}
+            {draftCard && (
+              <div className="chat-draft">
+                <DraftCard
+                  intake={draftCard.intake}
+                  uploads={draftCard.uploads}
+                  onDone={(message) => {
+                    setDraftCard(null);
+                    appendAgentMessage(message);
+                  }}
+                  onCancel={() => {
+                    setDraftCard(null);
+                    appendAgentMessage("Okay, I dropped that draft.");
+                  }}
+                />
+              </div>
+            )}
           </div>
+
+          {pendingIntake !== null && (
+            <p className="chat-pending-note muted" role="status">
+              Your next message answers Eclipse&apos;s question about
+              the mission.{" "}
+              <button
+                type="button"
+                className="task-card-dismiss"
+                onClick={() => setPendingIntake(null)}
+              >
+                Drop it
+              </button>
+            </p>
+          )}
 
           {composer}
         </>

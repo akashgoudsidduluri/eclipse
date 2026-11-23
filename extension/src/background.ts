@@ -16,6 +16,7 @@ const SERVER = "http://127.0.0.1:8000";
 import { BRIEFING_ALARM, checkDueWatches, watchAlarmName, type Watch } from "./monitor.js";
 import { MISSIONS_ALARM, MISSIONS_PERIOD_MIN, defaultNotifyApproval, runDueMissions, type ElementInfo, type ExecuteStepResult, type MissionDue, type Observation, type PlannerAction } from "./missions.js";
 import { notifyBriefing, notifyWatchFired } from "./notifications.js";
+import { RealtimeClient, type SocketLike } from "./realtime.js";
 
 async function serverToken(): Promise<string> {
   const stored = await chrome.storage.local.get("eclipseToken");
@@ -103,6 +104,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes["eclipseToken"]?.newValue) {
     void scheduleWatchAlarms();
+    // PR #7 (W3): the realtime driver needs the token too —
+    // connect it as soon as the token exists.
+    void ensureRealtimeConnected();
   }
 });
 
@@ -214,6 +218,180 @@ async function executeStepOnServer(
   return { ok: false, detail: text };
 }
 
+/** Per-task tab registry (PR #7, W3): task id -> tab id. The
+ * server keeps a mirror (hub tab registry); this map is the
+ * authority for which tab a task's actions land in. A task's
+ * tab is opened by init_session — a chat task gets a real tab
+ * immediately, instead of the missions rule (skip the job
+ * unless the user already has the page open). */
+const taskTabs = new Map<string, number>();
+
+/** Open (or find) a task's tab. An existing tab is reused when
+ * it is still open, so a re-drive never opens a second tab; a
+ * closed tab is re-created, so a drive self-heals. The tab
+ * starts in the background — observeTab activates it when
+ * driving starts. */
+async function findOrCreateTaskTab(
+  taskId: string,
+  url?: string,
+): Promise<{ tab_id: number; url: string }> {
+  const existing = taskTabs.get(taskId);
+  if (existing !== undefined) {
+    try {
+      const tab = await chrome.tabs.get(existing);
+      return { tab_id: existing, url: tab.url ?? url ?? "" };
+    } catch {
+      // The tab is gone — fall through and open a new one.
+      taskTabs.delete(taskId);
+    }
+  }
+  const tab = await chrome.tabs.create(
+    url ? { url, active: false } : { active: false },
+  );
+  if (tab.id === undefined) throw new Error("could not open a tab for the task");
+  taskTabs.set(taskId, tab.id);
+  return { tab_id: tab.id, url: tab.url ?? url ?? "" };
+}
+
+/** Observe a task's tab. A blank / browser-internal tab has no
+ * content script, so the walk would fail: return a minimal
+ * observation instead (the first step is usually a navigate,
+ * which needs no elements). Real pages always take the full
+ * observe path — errors there propagate, so a broken vision
+ * pipeline is never silent. */
+async function observeTaskTab(taskId: string): Promise<Observation> {
+  const tabId =
+    taskTabs.get(taskId) ?? (await findOrCreateTaskTab(taskId)).tab_id;
+  const tab = await chrome.tabs.get(tabId);
+  const tabUrl = tab.url ?? "";
+  if (!/^https?:\/\//i.test(tabUrl)) {
+    return { url: tabUrl, elements: [] };
+  }
+  return (await observeTab(tabId)) as Observation;
+}
+
+/** Wait for a tab to finish loading (or the timeout — the
+ * driver re-observes and verifies anyway, so a slow page must
+ * not fail the step here). */
+function waitForTabLoad(tabId: number, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+    const listener = (updatedId: number, info: { status?: string }) => {
+      if (updatedId === tabId && info.status === "complete") finish();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    setTimeout(finish, timeoutMs);
+  });
+}
+
+/** Perform one validated action in a task's tab. A navigate
+ * from a blank tab has no content script to run the executor
+ * in, so it goes via the tabs API instead. The server already
+ * validated the action (allow-list included) before sending it
+ * over the token-authenticated socket; the scheme check here
+ * is the fail-closed backstop. Other actions go to the content
+ * script's guarded executor, exactly like the missions driver. */
+async function executeTaskAction(
+  tabId: number,
+  action: PlannerAction,
+  options: {
+    taskId?: string;
+    allowedSites?: string[];
+    expected?: ElementInfo;
+    fill?: Record<string, string>;
+  },
+): Promise<{ ok: boolean; detail?: string; url?: string }> {
+  if (action.action === "navigate") {
+    const url = action.url ?? "";
+    if (!/^https?:\/\//i.test(url)) {
+      return { ok: false, detail: "navigate needs a full http(s) URL" };
+    }
+    await chrome.tabs.update(tabId, { url });
+    await waitForTabLoad(tabId, 15000);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    return { ok: true, url: tab?.url ?? url };
+  }
+  const result = (await chrome.tabs.sendMessage(tabId, {
+    type: "execute",
+    action,
+    options,
+  })) as { ok: boolean; detail?: string; url?: string };
+  return result;
+}
+
+/** The realtime client (PR #7, W3): one persistent WebSocket
+ * to the server, driving ANY task. Created lazily — the
+ * service worker may wake without a token (or without a
+ * network), and connect() handles that by waiting for the
+ * token-change listener. */
+let realtimeClient: RealtimeClient | null = null;
+
+function getRealtimeClient(): RealtimeClient {
+  if (realtimeClient) return realtimeClient;
+  realtimeClient = new RealtimeClient({
+    serverBase: SERVER,
+    getToken: serverToken,
+    // The real WebSocket's MessageEvent is structurally wider
+    // than SocketLike's {data} — the cast is the seam.
+    createSocket: (url) => new WebSocket(url) as unknown as SocketLike,
+    handlers: {
+      initSession: async (taskId, url) => {
+        const tab = await findOrCreateTaskTab(taskId, url);
+        return { ok: true, tab_id: tab.tab_id, url: tab.url };
+      },
+      observe: async (taskId) => observeTaskTab(taskId),
+      execute: async (taskId, action, options) => {
+        const tabId =
+          taskTabs.get(taskId) ?? (await findOrCreateTaskTab(taskId)).tab_id;
+        return executeTaskAction(tabId, action, options);
+      },
+      closeSession: async (taskId) => {
+        // The tab stays open — the user should see the result
+        // ("open google" must not close Google again).
+        taskTabs.delete(taskId);
+        return { ok: true };
+      },
+    },
+    onDisconnect: () => {
+      console.warn("[eclipse] realtime disconnected; reconnecting with backoff");
+    },
+  });
+  return realtimeClient;
+}
+
+/** Connect the realtime driver (idempotent — safe to call on
+ * every service-worker wake). Failures log, never throw: the
+ * missions alarm re-runs this within 15 minutes anyway. */
+async function ensureRealtimeConnected(): Promise<void> {
+  try {
+    await getRealtimeClient().connect();
+  } catch (err) {
+    console.warn("[eclipse] could not connect the realtime driver:", err);
+  }
+}
+
+// A closed tab drops its task mapping at once (and the server
+// is told, so its mirror drops the stale entry too). If the
+// socket is down the notice is lost — harmless, because the
+// next drive re-opens the tab anyway. The ?. is for the node
+// test fakes, whose chrome.tabs has no onRemoved (real Chrome
+// always does); background.ts registers listeners at import
+// time, so an unguarded access fails every test that imports it.
+chrome.tabs.onRemoved?.addListener((tabId) => {
+  for (const [taskId, id] of taskTabs) {
+    if (id === tabId) {
+      taskTabs.delete(taskId);
+      realtimeClient?.notifyTabClosed(tabId);
+    }
+  }
+});
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === BRIEFING_ALARM) {
     (async () => {
@@ -318,6 +496,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       // missions run, so a watch created in the workspace gets
       // an alarm within 15 minutes even without a restart.
       await scheduleWatchAlarms();
+      // PR #7 (W3): the worker is awake — make sure the
+      // realtime driver is connected too (a suspended worker
+      // drops its socket; the alarm is the backstop wake).
+      void ensureRealtimeConnected();
     })();
     return;
   }
@@ -391,6 +573,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onStartup.addListener(() => {
   void scheduleWatchAlarms();
+  void ensureRealtimeConnected();
 });
 
 async function ensureOffscreen(): Promise<void> {

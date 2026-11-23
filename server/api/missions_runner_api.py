@@ -1,8 +1,15 @@
 """Missions runner API (PR #5, W2): intake + the extension pull
 endpoints + run-now + resume handling.
 
-- POST /missions/intake {message} -> a mission draft (never
-  creates a mission; planner failure falls through to rules).
+- POST /missions/intake {message, upload_ids?, chat_message_id?,
+  store_in_chat?} -> a mission draft (never creates a mission;
+  planner failure falls through to rules). PR #7: upload_ids
+  attach chat-uploaded files (a resume) to the intake — the
+  extracted text enriches the draft locally and the resume's
+  profile facts come back as PROPOSED facts; store_in_chat
+  (default false) also stores the message + the draft-card
+  reply in the chat thread, so a mission set up from chat
+  stays in the thread.
 - GET /missions/due -> browser jobs waiting for the extension
   (also the extension heartbeat: every call updates
   memory["missions:last_extension_seen_at"]).
@@ -30,6 +37,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -40,6 +48,7 @@ from ..missions import intake as intake_mod
 from ..missions import resume as resume_mod
 from ..missions import runner
 from ..missions import models
+from ..missions import uploads as uploads_mod
 
 router = APIRouter(tags=["missions"])
 
@@ -56,6 +65,18 @@ def _heartbeat(conn) -> int:
 
 class IntakeIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
+    # PR #7: chat uploads attached to the message (a resume).
+    # Their extracted text enriches the draft locally; unknown
+    # ids are ignored (the intake still works on the message).
+    upload_ids: list[str] = Field(default_factory=list)
+    # The chat message this intake belongs to (when the caller
+    # already stored one) — stamped onto the uploads.
+    chat_message_id: str | None = Field(default=None, max_length=120)
+    # Store the message + the draft-card reply in the chat
+    # thread (the Agent view's flow). Default false: callers
+    # that are not the chat thread (the Missions view form)
+    # keep the old behaviour — no thread rows.
+    store_in_chat: bool = False
 
 
 class ResumeTextIn(BaseModel):
@@ -63,15 +84,68 @@ class ResumeTextIn(BaseModel):
     filename: str = Field(default="resume.txt", max_length=200)
 
 
+def _store_chat_pair(conn, user_text: str, agent_text: str,
+                     source: str | None = None) -> tuple[str, str]:
+    """Store one user message + one agent reply in
+    chat_messages (the same shape chat_api._store writes — the
+    intake router writes its own rows rather than importing the
+    chat router's private helper). Returns (user_id, agent_id).
+    The agent row's kind is "chat": a draft card is a reply,
+    not a task. `source` labels how the reply was made
+    ("planner"/"rules"), like chat_api does."""
+    now = int(time.time())
+    user_id = f"msg-{uuid.uuid4().hex[:12]}"
+    agent_id = f"msg-{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        "INSERT INTO chat_messages (id, role, text, kind, task_id,"
+        " source, created_at) VALUES (?, 'user', ?, 'chat', NULL,"
+        " NULL, ?)",
+        (user_id, user_text, now),
+    )
+    conn.execute(
+        "INSERT INTO chat_messages (id, role, text, kind, task_id,"
+        " source, created_at) VALUES (?, 'agent', ?, 'chat', NULL,"
+        " ?, ?)",
+        (agent_id, agent_text, source, now),
+    )
+    conn.commit()
+    return user_id, agent_id
+
+
 @router.post("/missions/intake")
 def post_intake(body: IntakeIn, _token: str = Depends(require_token)):
     """Draft a mission from one chat message. Planner failure
     is NOT an error — it falls through to the rule-based path
-    (source "rules")."""
+    (source "rules"). With upload_ids, the uploads' extracted
+    text enriches the draft locally (never sent to a model)
+    and their proposed facts come back for the user to confirm
+    in chat. With store_in_chat, the message + the draft-card
+    reply are stored in the chat thread and the uploads are
+    linked to the stored user message."""
+    conn = _conn()
     try:
-        return intake_mod.parse_intake(body.message)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = intake_mod.parse_intake(
+                body.message, upload_ids=body.upload_ids, conn=conn)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        message_id = body.chat_message_id
+        if body.store_in_chat:
+            reply = result["draft_card"]
+            if result.get("clarifying_question"):
+                reply += "\n\n" + result["clarifying_question"]
+            user_id, agent_id = _store_chat_pair(
+                conn, body.message.strip(), reply,
+                source=result.get("source"))
+            message_id = user_id
+            result["chat_message_id"] = user_id
+            result["chat_reply_id"] = agent_id
+        if message_id and body.upload_ids:
+            uploads_mod.link_uploads(
+                conn, body.upload_ids, chat_message_id=message_id)
+        return result
+    finally:
+        conn.close()
 
 
 @router.get("/missions/due")

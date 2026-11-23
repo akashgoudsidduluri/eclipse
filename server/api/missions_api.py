@@ -38,6 +38,7 @@ from ..core import db
 from ..core.auth import require_token
 from ..mail import drafts as draft_mod
 from ..missions import links, models
+from ..missions import uploads as uploads_mod
 from ..tasks import approvals, loop
 
 router = APIRouter(tags=["missions"])
@@ -49,6 +50,10 @@ class MissionIn(BaseModel):
     config: dict = Field(default_factory=dict)
     # Bounds optional — the type defaults fill them in.
     bounds: dict | None = Field(default=None)
+    # PR #7: chat uploads the mission was created from (a
+    # resume attached in chat) — linked to the mission for
+    # provenance. Unknown ids are ignored.
+    upload_ids: list[str] = Field(default_factory=list)
 
 
 class MissionPatch(BaseModel):
@@ -108,10 +113,14 @@ def create_mission(body: MissionIn, _token: str = Depends(require_token)):
     conn = _conn()
     try:
         try:
-            return models.create_mission(
+            mission = models.create_mission(
                 conn, body.type, body.name, body.config, body.bounds or {})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if body.upload_ids:
+            uploads_mod.link_uploads(
+                conn, body.upload_ids, mission_id=mission["id"])
+        return mission
     finally:
         conn.close()
 

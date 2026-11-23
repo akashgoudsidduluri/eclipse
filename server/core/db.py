@@ -102,11 +102,28 @@ CREATE INDEX IF NOT EXISTS idx_mission_activity_kind_day
 -- message, user and agent alike. Timestamps are integer SECONDS
 -- (never ms). source is "planner" or "rules" on agent rows, NULL
 -- on user rows; task_id links the reply that created a task.
+-- PR #7: provider names the model that answered ("ollama",
+-- "antseed", "groq") on planner rows, NULL on rules/user rows.
 CREATE TABLE IF NOT EXISTS chat_messages(
   id TEXT PRIMARY KEY, role TEXT, text TEXT, kind TEXT,
-  task_id TEXT NULL, source TEXT NULL, created_at INTEGER);
+  task_id TEXT NULL, source TEXT NULL, provider TEXT NULL,
+  created_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_created
   ON chat_messages(created_at);
+-- PR #7: chat file uploads — one row per attached file. The
+-- bytes live under data/uploads/ (0600, non-guessable name);
+-- this table holds the metadata, the locally extracted text,
+-- the proposed profile facts (JSON), and the linkage to the
+-- chat message it was sent with and the mission created from
+-- it (both NULL until linked).
+CREATE TABLE IF NOT EXISTS chat_uploads(
+  id TEXT PRIMARY KEY, original_name TEXT, stored_name TEXT,
+  stored_path TEXT, size_bytes INTEGER, mime TEXT,
+  extraction_status TEXT, extracted_text TEXT,
+  proposed_facts_json TEXT, chat_message_id TEXT NULL,
+  mission_id TEXT NULL, created_at INTEGER);
+CREATE INDEX IF NOT EXISTS idx_chat_uploads_message
+  ON chat_uploads(chat_message_id);
 """
 
 # Verified free top 5 (Sprint 0 probe, 2026-11-21). gpt-oss-120b is
@@ -380,16 +397,41 @@ def migrate(db_path: Path | None = None) -> None:
                 conn.execute(
                     "CREATE TABLE chat_messages("
                     " id TEXT PRIMARY KEY, role TEXT, text TEXT, kind TEXT,"
-                    " task_id TEXT NULL, source TEXT NULL, created_at INTEGER)"
+                    " task_id TEXT NULL, source TEXT NULL,"
+                    " provider TEXT NULL, created_at INTEGER)"
                 )
             chat_cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(chat_messages)")}
             if "source" not in chat_cols:
                 conn.execute(
                     "ALTER TABLE chat_messages ADD COLUMN source TEXT NULL")
+            # PR #7: provider names the model that answered; a
+            # database migrated before PR #7 gets it here.
+            if "provider" not in chat_cols:
+                conn.execute(
+                    "ALTER TABLE chat_messages ADD COLUMN provider TEXT NULL")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_messages_created"
                 " ON chat_messages(created_at)")
+            # PR #7: chat_uploads — the Agent view's attached
+            # files. The SCHEMA string declares it for fresh
+            # databases; existing ones get it here.
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "chat_uploads" not in tables:
+                conn.execute(
+                    "CREATE TABLE chat_uploads("
+                    " id TEXT PRIMARY KEY, original_name TEXT,"
+                    " stored_name TEXT, stored_path TEXT,"
+                    " size_bytes INTEGER, mime TEXT,"
+                    " extraction_status TEXT, extracted_text TEXT,"
+                    " proposed_facts_json TEXT,"
+                    " chat_message_id TEXT NULL,"
+                    " mission_id TEXT NULL, created_at INTEGER)"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_uploads_message"
+                " ON chat_uploads(chat_message_id)")
             reset_at = _next_midnight_utc_epoch()
             for model in FREE_MODELS:
                 conn.execute(

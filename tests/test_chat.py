@@ -232,11 +232,14 @@ class TestChatRespond(unittest.TestCase):
     def test_planner_task_path_creates_task_with_constraints(self):
         call = _planner_call({
             "kind": "task_created",
-            "reply_text": "I'll watch for those roles.",
+            "reply_text": "I'll look for those roles.",
             "constraints": "remote only",
         })
+        # PR #7: "watch for SDE intern roles" now drafts a
+        # mission (standing watch), so the planner task path is
+        # exercised with a plain one-off instruction.
         result = chat_api.respond(
-            self.conn, "watch for SDE intern roles in Hyderabad",
+            self.conn, "find SDE intern roles in Hyderabad",
             call_fn=call,
         )
         self.assertEqual(result["source"], "planner")
@@ -244,7 +247,7 @@ class TestChatRespond(unittest.TestCase):
         self.assertIsNotNone(result["task_id"])
         task = loop.get_task(self.conn, result["task_id"])
         self.assertEqual(task["goal"],
-                         "watch for SDE intern roles in Hyderabad")
+                         "find SDE intern roles in Hyderabad")
         self.assertEqual(task["constraints"], "remote only")
 
     def test_planner_chat_path_creates_no_task(self):
@@ -543,7 +546,9 @@ class TestChatApi(unittest.TestCase):
 
     def test_new_instruction_with_active_task_starts_a_new_task(self):
         first = self._create_task_via_chat()
-        status, body = self._chat("watch the price of headphones")
+        # PR #7: "watch the price of headphones" now drafts a
+        # price-watch mission instead of a task.
+        status, body = self._chat("find the price of headphones")
         self.assertEqual(status, 200, body)
         self.assertEqual(body["kind"], "task_created")
         self.assertNotEqual(body["task_id"], first)

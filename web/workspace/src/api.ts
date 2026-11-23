@@ -74,6 +74,37 @@ export type TaskDetail = {
  * the reply — history rows may omit it, so it is optional
  * and the UI shows no source note rather than guessing one.
  * created_at is unix seconds. */
+/** ---- chat uploads (PR #7) ---- */
+
+/** One proposed profile fact from an uploaded resume —
+ * shown in chat for the user to confirm before anything is
+ * stored as profile facts. */
+export type ProposedFact = {
+  field: string;
+  label: string;
+  value: string | number | string[];
+};
+
+/** A file attached in chat, as POST /chat/uploads and
+ * GET /chat/uploads return it. `extracted_text` is the
+ * locally extracted text (never sent to a model);
+ * `proposed_facts` is empty for non-resume files. */
+export type ChatUpload = {
+  id: string;
+  filename: string;
+  stored_name: string;
+  stored_path: string;
+  size_bytes: number;
+  mime: string;
+  extraction_status: "ok" | "limited" | "unsupported";
+  extracted_text: string | null;
+  proposed_facts: ProposedFact[];
+  chat_message_id: string | null;
+  mission_id: string | null;
+  uploaded_at: number;
+  note: string;
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "agent";
@@ -82,18 +113,31 @@ export type ChatMessage = {
   task_id: string | null;
   created_at: number;
   source?: "planner" | "rules";
+  /** PR #7: which provider answered ("ollama" | "antseed" |
+   * "groq" | …), or null when rules answered. History rows
+   * carry it from the chat_messages.provider column. */
+  provider?: string | null;
+  /** Files attached to this message (in-session sends, and
+   * history rows matched by chat_message_id). */
+  attachments?: ChatUpload[];
 };
 
 /** POST /chat/message: the agent's reply. kind "chat" is a
  * plain reply — a greeting never creates a task; kind
  * "task_created" anchors a task card under the reply via
- * task_id. source names the path that answered. */
+ * task_id. source names the path that answered; provider
+ * names the model that answered (null when rules did).
+ * draft is present only when the message was a standing-
+ * mission ask — the intake result, for the UI's draft card
+ * (same shape as POST /missions/intake returns). */
 export type ChatReply = {
   message_id: string;
   reply_text: string;
   kind: "chat" | "task_created";
   task_id: string | null;
   source: "planner" | "rules";
+  provider: string | null;
+  draft?: IntakeResponse | null;
 };
 
 /** A pending human-gate approval, as the server records it
@@ -515,7 +559,7 @@ export type RagStatus = {
 
 /** ---- missions (PR #5) ---- */
 
-export type MissionType = "job_hunt" | "cold_mail" | "price_watch";
+export type MissionType = "job_hunt" | "cold_mail" | "price_watch" | "email_monitor";
 
 export type MissionStatus = "draft" | "active" | "paused" | "stopped" | "done";
 
@@ -547,7 +591,9 @@ export type Mission = {
 };
 
 /** A mission draft from POST /missions/intake — the POST
- * /missions body minus status. */
+ * /missions body minus status. Four types since PR #7:
+ * job_hunt, cold_mail, price_watch, and email_monitor (the
+ * inbox-watch mission). The server validates the type. */
 export type MissionDraft = {
   type: MissionType;
   name: string;
@@ -561,6 +607,19 @@ export type IntakeResponse = {
   confidence: "high" | "low";
   missing_fields: string[];
   warnings: string[];
+  /** PR #7: at most one question, only when the intake is
+   * genuinely blocked on something answerable in chat. */
+  clarifying_question?: string | null;
+  /** PR #7: the draft as plain language for the chat thread. */
+  draft_card?: string;
+  /** PR #7: proposed profile facts from an attached resume. */
+  proposed_facts?: ProposedFact[];
+  /** PR #7: the uploads the intake used. */
+  upload_ids?: string[];
+  /** PR #7: set when the intake stored the exchange in the
+   * chat thread (store_in_chat). */
+  chat_message_id?: string;
+  chat_reply_id?: string;
 };
 
 export type MissionActivity = {
@@ -876,6 +935,57 @@ export const api = {
   /** Chat history, oldest first. Limit defaults to 50. */
   chatHistory: (limit = 50) =>
     call<{ messages: ChatMessage[] }>(`/chat/history?limit=${limit}`),
+
+  // ---- chat uploads (PR #7) ----
+  /** Upload a file attached in chat. XMLHttpRequest (not
+   * fetch) so the composer can show upload progress. The
+   * response carries the extracted text and the proposed
+   * profile facts when the file looks like a resume. */
+  uploadChatFile: (file: File, onProgress?: (pct: number) => void): Promise<ChatUpload> =>
+    new Promise((resolve, reject) => {
+      const token = getToken();
+      if (!token) {
+        reject(new Error("no token — paste the server token first"));
+        return;
+      }
+      const form = new FormData();
+      form.append("file", file);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/chat/uploads");
+      xhr.setRequestHeader("X-Eclipse-Token", token);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress) {
+          onProgress(Math.round((e.loaded / e.total) * 100));
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status === 401) {
+          window.dispatchEvent(new Event("eclipse-unauthorized"));
+          reject(new Error("unauthorized — check the token"));
+          return;
+        }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(
+            new Error(
+              `${xhr.status} on /chat/uploads: ${xhr.responseText.slice(0, 200)}`,
+            ),
+          );
+          return;
+        }
+        resolve(JSON.parse(xhr.responseText) as ChatUpload);
+      };
+      xhr.onerror = () => reject(new Error("upload failed — check the server"));
+      xhr.send(form);
+    }),
+  /** Recent chat uploads, newest first — optionally only the
+   * ones linked to one chat message (the thread renders its
+   * file chips from this). */
+  listChatUploads: (chatMessageId?: string) => {
+    const q = chatMessageId
+      ? `?chat_message_id=${encodeURIComponent(chatMessageId)}`
+      : "";
+    return call<{ uploads: ChatUpload[] }>(`/chat/uploads${q}`);
+  },
 
   // ---- jobs ----
   setProfile: (resumeText: string) =>
@@ -1215,17 +1325,29 @@ export const api = {
    * server labels the source — "planner" or "rules" — and
    * the UI must show it, never hide it. A planner failure
    * falls through to the rule path server-side; it is not
-   * an error here. */
-  intakeMission: (message: string) =>
+   * an error here. PR #7: `uploadIds` attaches chat-uploaded
+   * files (a resume) — their text enriches the draft locally
+   * and their proposed facts come back for confirmation;
+   * `storeInChat` also stores the exchange in the thread. */
+  intakeMission: (
+    message: string,
+    options?: { uploadIds?: string[]; storeInChat?: boolean },
+  ) =>
     call<IntakeResponse>("/missions/intake", {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({
+        message,
+        upload_ids: options?.uploadIds ?? [],
+        store_in_chat: options?.storeInChat ?? false,
+      }),
     }),
   createMission: (body: {
     type: MissionType;
     name: string;
     config: Record<string, unknown>;
     bounds?: Partial<MissionBounds>;
+    /** PR #7: chat uploads the mission was created from. */
+    upload_ids?: string[];
   }) =>
     call<Mission>("/missions", {
       method: "POST",

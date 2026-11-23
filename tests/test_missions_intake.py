@@ -310,5 +310,48 @@ class TestTypesValidation(unittest.TestCase):
             types_mod.default_bounds("price_watch")["max_applies_per_day"], 0)
 
 
+class TestIsMissionRequest(unittest.TestCase):
+    """PR #7: the chat router's standing-mission detector —
+    continuous language AND a mission-type signal."""
+
+    def test_mission_requests(self):
+        for text in (
+            "watch my inbox for interview mails",
+            "keep applying for remote SDE intern roles",
+            "continuously apply across platforms for this role",
+            "tell me when the price drops below 4999",
+            "monitor the price of headphones",
+            "send me cold mails every day",
+            "alert me when an offer mail arrives",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    intake_mod.is_mission_request(text), text)
+
+    def test_one_off_tasks_are_not_missions(self):
+        for text in (
+            "find me a job",
+            "open google",
+            "watch this video",
+            "keep this tab open",
+            "hi",
+            "send a mail to ravi@example.com",
+            "what is the price of headphones",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    intake_mod.is_mission_request(text), text)
+
+    def test_monitor_the_price_picks_price_watch(self):
+        # "monitor" is a generic continuous verb, not an inbox
+        # signal — it only counts for email_monitor with an
+        # inbox/mail word present.
+        mission_type, _ = intake_mod._pick_type(
+            "monitor the price of headphones")
+        self.assertEqual(mission_type, "price_watch")
+        mission_type, _ = intake_mod._pick_type("monitor my inbox")
+        self.assertEqual(mission_type, "email_monitor")
+
+
 if __name__ == "__main__":
     unittest.main()

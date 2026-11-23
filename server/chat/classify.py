@@ -11,8 +11,26 @@ planner call).
 
 Decision order in classify_rules:
   1. greeting / small talk  -> kind "chat" (hard: never a task)
-  2. imperative + object    -> kind "task_created"
-  3. anything else          -> kind "chat" + ONE clarifying question
+  2. identity statement / correction ("i'm Akash", "no, my name
+     is Y") -> kind "chat" (hard: never a task) + an "identity"
+     payload the caller stores as a profile fact
+  3. "remember ..."         -> kind "chat" (hard) + a "remember"
+     payload the caller stores (or refuses, for PII/credentials)
+  4. imperative + object    -> kind "task_created"
+  5. other statements ("i'm a student", "i live in Hyderabad")
+     -> kind "chat", reason "statement": the model answers
+     conversationally; the rules fallback is an honest
+     no-model message, never a clarifying question
+  6. anything else          -> kind "chat" + ONE clarifying question
+
+PR #7 fix (Prateek's live test): "i'm Akash" used to become the
+bare name "Akash" — the "i'm " prefix was stripped and the
+fragment got the same clarifying question twice. The name
+statement is now its own category, and the "i'm " prefix is
+NEVER stripped into a bare name: parse_identity runs before the
+task check, and _PREFIXES is only used to find an imperative
+verb (where "i'm looking for jobs" still strips to the verb
+phrase "looking for").
 
 Steering (classify_steering) runs BEFORE this decision, but only
 when the conversation has an active task: stop/cancel/pause act on
@@ -293,18 +311,293 @@ def _clarification(text: str) -> str:
     )
 
 
+# ----------------------------------------------------------------
+# Identity, statements, corrections, "remember ..." (PR #7)
+# ----------------------------------------------------------------
+
+# Honest replies for when no model answers. Neither asks a
+# question: a reply of only questions is a failure, and asking
+# the same clarifying question twice is worse — the caller
+# (chat_api.respond) uses REPEATED_QUESTION_REPLY when the rules
+# clarifier would repeat the last question word for word.
+NO_MODEL_REPLY = (
+    "I couldn't reach a model to chat about that, so I can't"
+    " answer properly right now. If you tell me as an"
+    " instruction — for example 'find remote SDE intern roles"
+    " in Hyderabad' — I can start it straight away."
+)
+REPEATED_QUESTION_REPLY = (
+    "I don't want to keep asking the same question — I couldn't"
+    " reach a model to work out what you mean. If you say it as"
+    " an instruction, like 'find remote SDE intern roles in"
+    " Hyderabad', I can start it straight away."
+)
+
+# First words after "i'm" / "i am" that are NOT a name: "i'm
+# looking for jobs" is a task, "i'm tired" is a state, "i'm in
+# Hyderabad" is a statement — none of them names the user.
+_NAME_BLOCKLIST = {
+    "looking", "searching", "trying", "waiting", "going", "coming",
+    "working", "studying", "living", "staying", "doing", "getting",
+    "thinking", "wondering", "hoping", "planning", "feeling",
+    "here", "back", "done", "not", "so", "just", "really", "sorry",
+    "afraid", "glad", "happy", "sad", "tired", "busy", "free",
+    "in", "at", "on", "new", "the", "a", "an", "sure", "fine",
+    "ok", "okay", "good", "great", "lost", "stuck", "confused",
+    "ready", "interested", "keen", "open", "available",
+    # Clause words a greedy name capture must never swallow:
+    # "my name is Akash and I'm looking for jobs" is not the
+    # name "Akash And I'm" — it is a task carrying a name.
+    "and", "or", "but", "i'm", "im", "i", "am",
+}
+# Words that can never be part of a name (a verb or a stopword
+# where a name should be means the pattern misfired).
+_NAME_STOPWORDS = _NAME_BLOCKLIST | set(_TASK_VERBS) | _OBJECT_STOPWORDS
+
+_CORRECTION_LEADS = ("no", "nope", "actually", "wait")
+
+
+def _tidy_name(raw: str) -> str | None:
+    """A plausible person name (1–3 words, letters only), or
+    None. All-lowercase input is title-cased ("akash" -> "Akash");
+    mixed-case input is kept as written ("McDonald" stays).
+    A trailing vocative ("man", "bro", "dude") is dropped when
+    another word remains — "my name is akash man" names Akash,
+    not "Akash Man". A lone vocative stays a name ("Man" alone
+    is a surname). Note: no comma handling here — a comma in
+    the remainder means a second clause, and the callers that
+    must tolerate one ("my name is", "call me") capture only
+    the name words with a bounded regex instead. The "i'm"
+    branch deliberately keeps the full capture, so "i'm Akash,
+    find me jobs" stays a task, not an identity."""
+    name = re.sub(r"\s+", " ", raw.strip().strip(" .!?,\"'")).strip()
+    if not name:
+        return None
+    words = name.split(" ")
+    if len(words) > 1 and words[-1].lower() in {"man", "bro", "dude", "mate"}:
+        words = words[:-1]
+        name = " ".join(words)
+    if len(words) > 3:
+        return None
+    for word in words:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", word):
+            return None
+        if word.lower() in _NAME_STOPWORDS:
+            return None
+    if name == name.lower():
+        name = " ".join(w.capitalize() for w in words)
+    return name
+
+
+def parse_identity(text: str) -> dict | None:
+    """A name statement or correction, or None. Pure.
+
+    Matches (case-insensitive, punctuation tolerated):
+    - "i'm Akash" / "i am Akash" — the remainder must be 1–3
+      words and must not start with a verb/state word, so "i'm
+      looking for jobs" is NOT a name (it is a task) and "i'm
+      tired" is NOT a name either.
+    - "my name is Akash" / "my name's Akash"
+    - "call me Akash"
+    - "it's Akash" (capitalised name only — "it's raining" is
+      not a name)
+    - corrections: a leading "no," / "actually" / "wait", or
+      "i just told you ...", marks correction=True.
+    Returns {"name", "correction"} — the caller stores the name
+    as a profile fact and confirms it. NEVER returns a bare
+    name with the "i'm" stripped and the statement lost: the
+    return value always carries the statement's meaning.
+    """
+    cleaned = _clean(text)
+    correction = False
+    core = cleaned
+    for lead in _CORRECTION_LEADS:
+        if core == lead or core.startswith(lead + " ") or core.startswith(lead + ","):
+            correction = True
+            core = core[len(lead):].strip(" ,").strip()
+            break
+    if "just told you" in core or "already told you" in core or "i said" in core:
+        correction = True
+    # "i just told you my name is Y" / "i said i'm Y": drop the
+    # preamble so the patterns below see the statement itself.
+    # The comma after "you" is tolerated ("i just told you, my
+    # name is Y") — without it the strip silently misses and
+    # the whole message falls through to a clarifier (found in
+    # live screenshot verification, 2026-11-23).
+    core = re.sub(r"^i (?:just |already )?told you[,\s]+", "", core)
+    core = re.sub(r"^i said[,\s]+", "", core)
+
+    name: str | None = None
+    # The name capture is BOUNDED (1–3 letter-words, stopping
+    # at the first comma or non-name word): "my name is akash,
+    # man" captures "akash", never "akash, man". The "i'm"
+    # branch below deliberately keeps the full capture, so
+    # "i'm Akash, find me jobs" stays a task.
+    _NAME_WORDS = r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,2})"
+
+    def _followed_by_task(match: re.Match) -> bool:
+        """A task verb after the matched name ("my name is
+        Akash, find me jobs") — the message is a task carrying
+        a name, not a name statement, so identity must not
+        swallow the instruction."""
+        rest = core[match.end():].lower()
+        if any(phrase in rest for phrase in _TASK_VERB_PHRASES):
+            return True
+        return any(w in _TASK_VERBS for w in re.findall(r"[a-z]+", rest))
+
+    match = re.match(rf"^(?:my name is|my name's)\s+{_NAME_WORDS}", core)
+    task_after_name = False
+    if match:
+        name = _tidy_name(match.group(1))
+        if name is not None and _followed_by_task(match):
+            name = None
+            task_after_name = True
+    if name is None and not task_after_name:
+        # Belt and braces: "my name is X" anywhere in the
+        # message, for preambles the strip above never saw
+        # ("listen, my name is Akash").
+        match = re.search(rf"my name is\s+{_NAME_WORDS}", core)
+        if match:
+            name = _tidy_name(match.group(1))
+            if name is not None and _followed_by_task(match):
+                name = None
+    if name is None:
+        match = re.match(rf"^call me\s+{_NAME_WORDS}", core)
+        if match:
+            name = _tidy_name(match.group(1))
+            if name is not None and _followed_by_task(match):
+                name = None
+    if name is None:
+        match = re.match(r"^(?:i'm|i am|im)\s+(.+)$", core)
+        if match:
+            remainder = match.group(1)
+            first = remainder.split(" ", 1)[0]
+            if first not in _NAME_BLOCKLIST:
+                name = _tidy_name(remainder)
+    if name is None:
+        # "it's Akash" — capitalised on the ORIGINAL text only.
+        match = re.match(
+            r"^it's\s+([A-Z][A-Za-z'\-]*(?: [A-Z][A-Za-z'\-]*){0,2})[.!?]*$",
+            text.strip(),
+        )
+        if match:
+            name = _tidy_name(match.group(1))
+    if name is None:
+        return None
+    return {"name": name, "correction": correction}
+
+
+def parse_remember(text: str) -> dict | None:
+    """An explicit "remember ..." fact capture, or None. Pure.
+
+    - "remember my city is Hyderabad" -> {"key": "city",
+      "value": "Hyderabad", "fact_text": "My city is Hyderabad."}
+    - "remember that i prefer remote roles" -> {"key": None,
+      "value": "i prefer remote roles",
+      "fact_text": "I prefer remote roles."}
+    - "remember i'm Akash" -> key "name" (the caller stores it
+      as a profile fact, like an identity statement).
+    The caller (chat_api) refuses PII/credential values before
+    storing — this parser only extracts, it never judges.
+
+    Matching runs on the ORIGINAL text (case-insensitive), not
+    the cleaned lowercase form: the value keeps the user's own
+    case ("Hyderabad", not "hyderabad"). Only the key is
+    lowercased — it is an identifier, used to find the old
+    value when a correction overwrites it.
+    """
+    match = re.match(
+        r"^\s*remember(?:\s+that)?\s+(.+?)\s*[.!?]*$",
+        text.strip(), re.IGNORECASE,
+    )
+    if not match:
+        return None
+    rest = re.sub(r"\s+", " ", match.group(1).strip())
+    if not rest:
+        return None
+    # "remember to check my mail" is a reminder, not a fact —
+    # it is not stored (it falls through to the task/model path).
+    if re.match(r"^to\s+", rest, re.IGNORECASE):
+        return None
+    key_match = re.match(r"^my\s+(.+?)\s+is\s+(.+)$", rest, re.IGNORECASE)
+    if key_match:
+        key = re.sub(r"\s+", " ", key_match.group(1).strip()).lower()
+        value = key_match.group(2).strip().strip(" .!?")
+        if (
+            key
+            and value
+            and len(value) <= 200
+            and len(key.split(" ")) <= 3
+            and all(re.fullmatch(r"[a-z]+", w) for w in key.split(" "))
+        ):
+            return {
+                "key": key,
+                "value": value,
+                "fact_text": f"My {key} is {value}.",
+            }
+        # A key that does not validate falls through to the
+        # free-form fact below — the user still gets it stored.
+    name_match = re.match(r"^(?:i'm|i am|im)\s+(.+)$", rest, re.IGNORECASE)
+    if name_match:
+        name = _tidy_name(name_match.group(1))
+        if name is not None:
+            return {
+                "key": "name",
+                "value": name,
+                "fact_text": f"My name is {name}.",
+            }
+    if len(rest) > 200:
+        return None
+    fact_text = rest.strip().strip(" .!?")
+    if not fact_text:
+        return None
+    fact_text = fact_text[0].upper() + fact_text[1:] + "."
+    return {"key": None, "value": rest, "fact_text": fact_text}
+
+
+_STATEMENT_RES = (
+    # "i'm a student" / "i'm in Hyderabad" / "i'm from Pune"
+    re.compile(r"^(i'm|i am|im)\s+(a|an|the|in|from|at|on)\b"),
+    re.compile(r"^i\s+(live|work|study)\b"),
+    re.compile(r"^i\s+(like|love|prefer|enjoy|hate)\b"),
+    re.compile(
+        r"^my\s+(city|college|university|location|country|state"
+        r"|company|team|goal|preference|favourite|favorite)\s+is\b"
+    ),
+)
+
+
+def _is_statement(cleaned: str) -> bool:
+    """A statement about the user that is neither a task nor a
+    name: the model answers it conversationally, and the rules
+    fallback is an honest no-model message — never a clarifying
+    question about something the user just told us."""
+    return any(rx.search(cleaned) for rx in _STATEMENT_RES)
+
+
 def classify_rules(text: str) -> dict:
     """The rules decision for one message. Pure.
 
-    Returns {"kind", "reply_text", "reason", "hard_chat"}:
-    - kind "chat" + hard_chat True: small talk. The caller must
+    Returns {"kind", "reply_text", "reason", "hard_chat"} plus,
+    for identity/remember decisions, an "identity" or "remember"
+    payload the caller acts on:
+    - kind "chat" + hard_chat True: small talk, an identity
+      statement/correction, or a "remember ...". The caller must
       never send this to the planner and never create a task.
+      Identity replies confirm the name ("Nice to meet you,
+      Akash — I'll remember that"); corrections confirm the
+      update ("Got it — I'll remember you as Y from now on.").
     - kind "task_created": a clear instruction (imperative + an
       object). The goal is the message itself.
+    - kind "chat" + reason "statement": a statement about the
+      user. The model answers it with history; the rules
+      fallback is NO_MODEL_REPLY (honest, no question).
     - kind "chat" + reason "ambiguous": a fragment the rules
       cannot act on. The caller may still ask the planner, which
       has the conversation history to resolve it — but with no
-      history the rules win (see chat_api.respond).
+      history the rules win (see chat_api.respond). The rules
+      clarifier is the LAST resort and must never repeat the
+      last question word for word (see chat_api.respond).
     """
     cleaned = _clean(text)
     small = _small_talk(cleaned)
@@ -313,10 +606,48 @@ def classify_rules(text: str) -> dict:
             "kind": "chat", "reply_text": small[1],
             "reason": small[0], "hard_chat": True,
         }
+    identity = parse_identity(text)
+    if identity is not None:
+        name = identity["name"]
+        if identity["correction"]:
+            reply = f"Got it — I'll remember you as {name} from now on."
+            reason = "correction"
+        else:
+            reply = f"Nice to meet you, {name} — I'll remember that."
+            reason = "identity"
+        return {
+            "kind": "chat", "reply_text": reply, "reason": reason,
+            "hard_chat": True, "identity": identity,
+        }
+    remember = parse_remember(text)
+    if remember is not None:
+        if remember["key"] == "name":
+            reply = (
+                f"Got it — I'll remember your name is"
+                f" {remember['value']}."
+            )
+        elif remember["key"]:
+            reply = (
+                f"Got it — I'll remember your {remember['key']} is"
+                f" {remember['value']}."
+            )
+        else:
+            value = remember["value"]
+            value = value[0].upper() + value[1:] if value else value
+            reply = f"Got it — I'll remember that {value}."
+        return {
+            "kind": "chat", "reply_text": reply, "reason": "remember",
+            "hard_chat": True, "remember": remember,
+        }
     if _is_task_instruction(cleaned):
         return {
             "kind": "task_created", "reply_text": _task_reply(text),
             "reason": "task", "hard_chat": False,
+        }
+    if _is_statement(cleaned):
+        return {
+            "kind": "chat", "reply_text": NO_MODEL_REPLY,
+            "reason": "statement", "hard_chat": False,
         }
     return {
         "kind": "chat", "reply_text": _clarification(cleaned),
@@ -459,7 +790,10 @@ You are Eclipse, a privacy-first browser agent. Classify the user's message and 
 {"kind": "chat" | "task_created", "reply_text": "<your reply>", "constraints": "<task limits or null>"}
 
 Rules:
-- kind "chat" for greetings, small talk, thanks, goodbyes, questions about what you can do, and messages too vague to act on. A bare noun like "internships" is too vague — ask ONE clarifying question instead of creating a task.
+- Talk like a helpful assistant, not a form: answer statements and questions naturally, using the conversation and the REMEMBERED FACTS. Never ask for a detail that is already in the conversation or the facts — if the user already told you their name or city, use it.
+- Assume defaults and start: if the message is close enough to an instruction, treat it as one. Ask at most ONE clarifying question, only when you are genuinely blocked — and never ask the same question twice. A reply that is only questions is a failure: lead with what you can do, and only then ask what you need.
+- If the user states a fact about themselves (their name, city, preference), acknowledge it briefly — the server stores it separately, so do not ask them to repeat it. If they correct something ("no, my name is Y"), accept the correction, do not re-ask.
+- kind "chat" for greetings, small talk, thanks, goodbyes, questions about what you can do, statements about the user, and messages too vague to act on. A bare noun like "internships" is too vague — ask ONE clarifying question instead of creating a task.
 - kind "task_created" ONLY when the message is a clear instruction to do something in the browser (find roles, watch a price, draft a mail, check a page). The goal is the message itself. A short reply to your clarifying question ("remote ones", "yes, Hyderabad") CAN be a task — resolve it against the conversation above.
 - NEVER return task_created for a greeting or small talk.
 - reply_text is plain words, one or two sentences. For a task, confirm what you will do and that you will ask before anything that applies, sends, or spends.

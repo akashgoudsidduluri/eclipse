@@ -1,9 +1,10 @@
-"""System endpoints: health, metrics, quota. All token-authenticated."""
+"""System endpoints: health, metrics, quota, brain. All token-authenticated."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
 from ..core import auth, db
+from ..planner import router as planner_router
 
 router = APIRouter(dependencies=[Depends(auth.require_token)], tags=["system"])
 
@@ -51,3 +52,16 @@ def quota() -> dict:
     finally:
         conn.close()
     return {"quota": [dict(row) for row in rows]}
+
+
+@router.get("/brain")
+def brain() -> dict:
+    """Which model providers are configured, in chain order, and
+    whether each one answers a cheap probe. Names and models
+    only — never keys. A missing model is visible here, not
+    silent: a provider with reachable=false (Ollama not running,
+    a dead gateway) shows up instead of failing every chat
+    message quietly. The probe is a 2s GET /models per
+    provider, so this endpoint can take a few seconds when
+    providers are down."""
+    return planner_router.brain_status(probe=True)

@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..core import db
 from ..core.auth import require_token
 from ..planner import validate
+from ..realtime import driver as realtime_driver
+from ..realtime.hub import hub as realtime_hub
 from ..tasks import approvals, loop
 
 router = APIRouter(tags=["tasks"])
@@ -138,7 +140,8 @@ def list_tasks(status: str | None = None, _token: str = Depends(require_token)):
 
 
 @router.post("/tasks/{task_id}/plan")
-def plan_task(task_id: str, _token: str = Depends(require_token)):
+def plan_task(task_id: str, background_tasks: BackgroundTasks,
+              _token: str = Depends(require_token)):
     _task_or_404(task_id)
     conn = _conn()
     try:
@@ -155,6 +158,13 @@ def plan_task(task_id: str, _token: str = Depends(require_token)):
         raise HTTPException(status_code=502, detail=f"planner failed: {exc}") from exc
     finally:
         conn.close()
+    # PR #7 (W3): a freshly planned task starts driving at once
+    # when the extension is live — the user should not have to
+    # press anything else after Plan. Fire-and-forget: the drive
+    # returns at once when the extension is offline (or the task
+    # is mission-linked), and the 30s driver sweep picks the
+    # task up when the extension reconnects.
+    background_tasks.add_task(realtime_driver.drive_task, realtime_hub, task_id)
     return {"task_id": task_id, "steps": steps}
 
 

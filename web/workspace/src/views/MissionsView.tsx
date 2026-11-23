@@ -2,7 +2,9 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   api,
   isHttpError,
+  type Draft,
   type IntakeResponse,
+  type MailLogEntry,
   type Mission,
   type MissionActivity,
   type MissionApproval,
@@ -58,6 +60,7 @@ const KNOWN_TYPES: { type: MissionType; label: string }[] = [
   { type: "job_hunt", label: "Job hunt" },
   { type: "cold_mail", label: "Cold mail" },
   { type: "price_watch", label: "Price watch" },
+  { type: "email_monitor", label: "Inbox watch" },
 ];
 
 /** Missing intake fields, phrased as the question the user
@@ -76,6 +79,7 @@ const MISSING_FIELD_PROMPTS: Record<string, string> = {
   currency: "Which currency?",
   min_score: "Minimum match score (0–100)?",
   sources: "Where should it look — Gmail, pasted roles, or both?",
+  keywords: "Which words should it watch for in your inbox?",
 };
 
 /** Config keys the draft editor renders, per type. Anything
@@ -88,6 +92,7 @@ const TYPE_CONFIG_KEYS: Record<MissionType, string[]> = {
   job_hunt: ["sources", "min_score", "stipend_min", "locations", "roles", "watch_new_only"],
   cold_mail: ["role_ids", "roles", "recipients", "attach_resume", "max_drafts_per_run"],
   price_watch: ["url", "selector", "condition", "target_price", "currency", "one_shot", "watch_id"],
+  email_monitor: ["keywords"],
 };
 
 /** Missing fields the draft editor answers inline, per type
@@ -99,6 +104,9 @@ const EDITABLE_MISSING: Record<MissionType, string[]> = {
   job_hunt: ["locations", "stipend_min", "min_score", "sources"],
   cold_mail: ["recipients", "role_ids", "roles"],
   price_watch: ["url", "selector", "target_price", "currency"],
+  // email_monitor keywords always have a default, so the
+  // field is never missing — nothing to answer inline.
+  email_monitor: [],
 };
 
 type ActivityTone = "ok" | "warn" | "bad" | "info" | "plain";
@@ -524,6 +532,15 @@ function activityTitle(a: MissionActivity): string {
       base = humanizeKey(a.kind);
   }
   return isSeeded(a.detail) ? `${base} · Seeded` : base;
+}
+
+/** One send-log line in plain words: what happened, and to
+ * whom. Unknown statuses fall back to the raw status so
+ * nothing is ever hidden. */
+function mailLogTitle(entry: MailLogEntry): string {
+  if (entry.status === "sent") return `Sent to ${entry.recipient}`;
+  if (entry.status === "bounced") return `Bounced — ${entry.recipient}`;
+  return `${entry.status} — ${entry.recipient}`;
 }
 
 function extractionTone(e: string | null): "ok" | "warn" | "bad" | "plain" {
@@ -1290,16 +1307,32 @@ function MissionDetailPane({
 export function MissionsView({
   token,
   onSelectTask,
-  onGoToJobs,
+  onGoToAgent,
 }: {
   token: string | null;
   onSelectTask?: (taskId: string) => void;
-  onGoToJobs?: () => void;
+  onGoToAgent?: () => void;
 }) {
   const [missions, setMissions] = useState<Mission[]>([]);
   // 24h activity counts per mission; null = the count call
   // failed, so the card says "unknown", never a fake zero.
   const [activityCounts, setActivityCounts] = useState<Record<string, number | null>>({});
+  // The activity itself, per mission — the Jobs status
+  // section below reads matched/applied counts off the same
+  // fetch, so it costs no extra call. A mission missing here
+  // means its activity fetch failed.
+  const [missionActivity, setMissionActivity] = useState<
+    Record<string, MissionActivity[]>
+  >({});
+  // Mail status (PR #7: the Mail view is gone; its status
+  // lives here). Null = not loaded yet or the fetch failed —
+  // mailFailed tells the two apart.
+  const [mailDrafts, setMailDrafts] = useState<Draft[] | null>(null);
+  const [mailLogEntries, setMailLogEntries] = useState<MailLogEntry[] | null>(null);
+  const [mailFailed, setMailFailed] = useState(false);
+  const [draftsShown, setDraftsShown] = useState(5);
+  const [logShown, setLogShown] = useState(5);
+  const [appliedShown, setAppliedShown] = useState(5);
   // Live pending approvals per mission, for the banner at the
   // top of the view. A failed fetch keeps the previous value
   // — a gap in polling must not hide a pending approval.
@@ -1372,6 +1405,7 @@ export function MissionsView({
         data.missions.map((m) => api.missionActivity(m.id, 100)),
       );
       const next: Record<string, number | null> = {};
+      const activities: Record<string, MissionActivity[]> = {};
       const dayAgo = Date.now() / 1000 - 24 * 3600;
       data.missions.forEach((m, i) => {
         const r = counts[i];
@@ -1379,8 +1413,22 @@ export function MissionsView({
           r.status === "fulfilled"
             ? r.value.activity.filter((a) => a.created_at >= dayAgo).length
             : null;
+        if (r.status === "fulfilled") activities[m.id] = r.value.activity;
       });
       setActivityCounts(next);
+      setMissionActivity(activities);
+      // Mail status: drafts + send log, same calls the old
+      // Mail view made. A failure keeps the previous lists
+      // and flags the section, never a fake empty state.
+      const [draftsRes, logRes] = await Promise.allSettled([
+        api.listDrafts(),
+        api.mailLog(),
+      ]);
+      if (draftsRes.status === "fulfilled") setMailDrafts(draftsRes.value.drafts);
+      if (logRes.status === "fulfilled") setMailLogEntries(logRes.value.log);
+      setMailFailed(
+        draftsRes.status === "rejected" || logRes.status === "rejected",
+      );
       // Pending approvals per mission, for the top banner.
       const approvalResults = await Promise.allSettled(
         data.missions.map((m) => api.missionApprovals(m.id)),
@@ -1677,6 +1725,28 @@ export function MissionsView({
       )
     : [];
 
+  // ---- Jobs status (PR #7: the Jobs view is gone) ----
+  // Matched / applied / discovered, read off the job-hunt
+  // missions' activity — the same fetch that feeds the 24h
+  // counts above, so this costs no extra call. Activity is
+  // capped at 100 entries per mission by that fetch, so the
+  // counts are "of the recent activity", not all-time.
+  const jobMissions = missions.filter((m) => m.type === "job_hunt");
+  const jobActivity = jobMissions.flatMap((m) => missionActivity[m.id] ?? []);
+  const jobActivityUnknown = jobMissions.some((m) => !(m.id in missionActivity));
+  const matchedCount = jobActivity.filter((a) => a.kind === "matched").length;
+  const discoveredCount = jobActivity.filter((a) => a.kind === "discovered").length;
+  const appliedActivity = jobActivity
+    .filter((a) => a.kind === "applied")
+    .sort((a, b) => b.created_at - a.created_at);
+
+  // ---- Mail status (PR #7: the Mail view is gone) ----
+  // Drafts by status + the send log, newest first.
+  const sortedDrafts = [...(mailDrafts ?? [])].sort((a, b) => b.created_at - a.created_at);
+  const sortedLog = [...(mailLogEntries ?? [])].sort((a, b) => b.created_at - a.created_at);
+  const draftStatusCount = (status: string) =>
+    (mailDrafts ?? []).filter((d) => d.status === status).length;
+
   return (
     <div className="view missions-view">
       <div className="view-head">
@@ -1685,7 +1755,9 @@ export function MissionsView({
           A mission watches and prepares on its own schedule — job hunt,
           cold mail, or price watch. Every apply and send still asks you
           first, unless you switch on standing approval. Missions run
-          while this laptop and server are on.
+          while this laptop and server are on. Job matches and mail
+          drafts from your missions show below as status — new ones
+          start in chat.
         </p>
       </div>
       {pendingEntries.length > 0 && (
@@ -1984,12 +2056,12 @@ export function MissionsView({
               <>
                 No job profile stored — job hunt and cold mail missions match
                 roles against it.{" "}
-                {onGoToJobs ? (
-                  <button type="button" onClick={onGoToJobs}>
-                    Add it in the Jobs view
+                {onGoToAgent ? (
+                  <button type="button" onClick={onGoToAgent}>
+                    Tell the Agent in chat
                   </button>
                 ) : (
-                  "Add it in the Jobs view."
+                  "Tell the Agent in chat."
                 )}
               </>
             ) : profile ? (
@@ -2163,6 +2235,165 @@ export function MissionsView({
             );
           })}
         </ul>
+      </section>
+
+      {/* PR #7: the Jobs view is gone — its status lives here.
+        Job hunts are set up in chat now; this section only
+        reports what the missions found and applied to. */}
+      <section aria-label="Jobs status" className="pane">
+        <SectionHeader title="Jobs status" />
+        <p className="muted">
+          What the job-hunt missions found and applied to, from their
+          recent activity. New job hunts start in chat — tell the Agent
+          the role, location, and stipend. Receipts for each apply also
+          show under the task in the Agent view.
+        </p>
+        {loading ? (
+          <Spinner label="Loading jobs status" />
+        ) : jobMissions.length === 0 ? (
+          <EmptyState>
+            No job-hunt missions yet — describe one in chat to start.
+          </EmptyState>
+        ) : (
+          <>
+            <SummaryChips
+              items={[
+                { label: "Roles found", value: String(discoveredCount) },
+                { label: "Matched", value: String(matchedCount) },
+                { label: "Applied", value: String(appliedActivity.length) },
+              ]}
+            />
+            {jobActivityUnknown && (
+              <p className="muted">
+                Activity for one mission couldn&apos;t be fetched, so these
+                counts may be low.
+              </p>
+            )}
+            <h3>Applied</h3>
+            {appliedActivity.length === 0 ? (
+              <EmptyState>
+                Nothing applied to yet — matches wait for your approval
+                unless a mission has standing approval.
+              </EmptyState>
+            ) : (
+              <>
+                <div className="activity-list">
+                  {appliedActivity.slice(0, appliedShown).map((a) => (
+                    <ActivityLine
+                      key={a.id}
+                      tone="ok"
+                      title={activityTitle(a)}
+                      detail={formatActivityDetail(a.detail)}
+                      when={a.created_at}
+                    />
+                  ))}
+                </div>
+                <ShowMore
+                  total={appliedActivity.length}
+                  shown={Math.min(appliedShown, appliedActivity.length)}
+                  onShowMore={() => setAppliedShown((s) => s + 5)}
+                  label="applies"
+                />
+              </>
+            )}
+          </>
+        )}
+      </section>
+
+      {/* PR #7: the Mail view is gone — its status lives here.
+        Cold-mail missions are set up in chat now; this
+        section only reports their drafts and sends. Drafts
+        waiting on approval appear in the mission approvals
+        above. */}
+      <section aria-label="Mail status" className="pane">
+        <SectionHeader title="Mail status" />
+        <p className="muted">
+          Drafts the cold-mail missions wrote, and what was actually
+          sent. New cold-mail missions start in chat.
+        </p>
+        {mailFailed && (
+          <p className="muted">
+            Couldn&apos;t load the latest mail status — showing the last
+            data fetched.
+          </p>
+        )}
+        {mailDrafts === null && mailLogEntries === null && !mailFailed ? (
+          <Spinner label="Loading mail status" />
+        ) : (
+          <>
+            <SummaryChips
+              items={[
+                { label: "Waiting", value: String(draftStatusCount("draft")) },
+                { label: "Approved", value: String(draftStatusCount("approved")) },
+                { label: "Sent", value: String(draftStatusCount("sent")) },
+                { label: "Bounced", value: String(draftStatusCount("bounced")) },
+              ]}
+            />
+            <h3>Drafts</h3>
+            {sortedDrafts.length === 0 ? (
+              <EmptyState>
+                No drafts yet — a cold-mail mission writes one per recruiter.
+              </EmptyState>
+            ) : (
+              <>
+                <ul className="plain-list">
+                  {sortedDrafts.slice(0, draftsShown).map((d) => (
+                    <li key={d.id} className="status-draft-row">
+                      <span className="status-draft-main">
+                        <span className="status-draft-recipient">{d.recipient}</span>
+                        <span className="muted status-draft-subject">{d.subject}</span>
+                        <span className="muted status-draft-meta">
+                          <RelativeTime ts={d.created_at} />
+                        </span>
+                      </span>
+                      <StatusChip tone={statusTone(d.status)}>
+                        {humanStatus(d.status)}
+                      </StatusChip>
+                    </li>
+                  ))}
+                </ul>
+                <ShowMore
+                  total={sortedDrafts.length}
+                  shown={Math.min(draftsShown, sortedDrafts.length)}
+                  onShowMore={() => setDraftsShown((s) => s + 5)}
+                  label="drafts"
+                />
+              </>
+            )}
+            <h3>Send log</h3>
+            {sortedLog.length === 0 ? (
+              <EmptyState>
+                No mails sent yet. Every send is logged here, per recruiter.
+              </EmptyState>
+            ) : (
+              <>
+                <ul className="mail-log-list">
+                  {sortedLog.slice(0, logShown).map((entry) => (
+                    <li key={entry.id}>
+                      <ActivityLine
+                        tone={statusTone(entry.status)}
+                        title={mailLogTitle(entry)}
+                        detail={
+                          <p className="muted">
+                            Role {entry.role_id}
+                            {entry.detail ? ` · ${entry.detail}` : ""}
+                          </p>
+                        }
+                        when={entry.created_at}
+                      />
+                    </li>
+                  ))}
+                </ul>
+                <ShowMore
+                  total={sortedLog.length}
+                  shown={Math.min(logShown, sortedLog.length)}
+                  onShowMore={() => setLogShown((s) => s + 5)}
+                  label="entries"
+                />
+              </>
+            )}
+          </>
+        )}
       </section>
 
       <ConfirmDialog

@@ -17,11 +17,8 @@ import {
   statusTone,
 } from "../components/ui";
 
-const CONDITIONS = ["changed", "appeared", "disappeared", "contains", "not_contains"];
-
 /** Human labels for the server's condition names. Values sent
- * to the server never change — only what the select and the
- * chips show. */
+ * to the server never change — only what the chips show. */
 const CONDITION_LABELS: Record<string, string> = {
   changed: "changes",
   appeared: "appears",
@@ -33,11 +30,14 @@ const CONDITION_LABELS: Record<string, string> = {
 /** How many events show before "Show more". */
 const EVENTS_PAGE_SIZE = 8;
 
-/** Watches + briefing (plan §8). Watches only run while
- * Chrome is open — the extension checks pages in open tabs on
- * a chrome.alarms schedule; the server never polls a page by
- * itself. The manual check here is for reporting an
- * observation you made yourself. */
+/** Watches + briefing (plan §8). Status only (PR #7): new
+ * watches are set up in chat — tell the Agent what page to
+ * watch — so this view lists the watches that exist, their
+ * events, and the morning briefing, with no setup form.
+ * Watches only run while Chrome is open — the extension
+ * checks pages in open tabs on a chrome.alarms schedule; the
+ * server never polls a page by itself. The manual check here
+ * is for reporting an observation you made yourself. */
 export function WatchesView({ token }: { token: string | null }) {
   const [watches, setWatches] = useState<Watch[]>([]);
   const [events, setEvents] = useState<WatchEvent[]>([]);
@@ -47,12 +47,6 @@ export function WatchesView({ token }: { token: string | null }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastOk, setLastOk] = useState<number | null>(null);
-
-  const [url, setUrl] = useState("");
-  const [selector, setSelector] = useState("");
-  const [condition, setCondition] = useState("changed");
-  const [intervalMin, setIntervalMin] = useState(60);
-  const [creating, setCreating] = useState(false);
 
   const [repairId, setRepairId] = useState<string | null>(null);
   const [repairSelector, setRepairSelector] = useState("");
@@ -101,28 +95,6 @@ export function WatchesView({ token }: { token: string | null }) {
 
   usePoll(load, [token], 15000);
   usePoll(loadBriefing, [token], 0);
-
-  const createWatch = async () => {
-    setCreating(true);
-    setError(null);
-    try {
-      await api.createWatch({
-        url: url.trim(),
-        selector: selector.trim(),
-        condition,
-        interval_min: intervalMin,
-      });
-      setUrl("");
-      setSelector("");
-      setCondition("changed");
-      setIntervalMin(60);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setCreating(false);
-    }
-  };
 
   const runWatchAction = async (
     id: string,
@@ -185,6 +157,7 @@ export function WatchesView({ token }: { token: string | null }) {
         <p className="muted">
           Watches follow a page element and fire when it changes. They only
           run while Chrome is open — the extension checks, never the server.
+          New watches start in chat: tell the Agent what page to watch.
         </p>
       </div>
       {error && <ErrorBanner error={error} lastOk={lastOk} onRetry={() => void load()} />}
@@ -193,72 +166,6 @@ export function WatchesView({ token }: { token: string | null }) {
           {checkResult}
         </p>
       )}
-
-      <section aria-label="Create a watch" className="pane">
-        <SectionHeader title="New watch" />
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void createWatch();
-          }}
-        >
-          <div>
-            <label htmlFor="watch-url">Page URL</label>
-            <input
-              id="watch-url"
-              type="url"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://…"
-              required
-            />
-          </div>
-          <div>
-            <label htmlFor="watch-selector">CSS selector for the element to follow</label>
-            <input
-              id="watch-selector"
-              value={selector}
-              onChange={(e) => setSelector(e.target.value)}
-              placeholder="e.g. #results .price"
-              required
-            />
-            <p className="field-help">
-              The element to follow, as a CSS selector. In Chrome, right-click
-              the element, choose Inspect, then Copy selector.
-            </p>
-          </div>
-          <div className="form-grid">
-            <div>
-              <label htmlFor="watch-condition">Fire when the element…</label>
-              <select
-                id="watch-condition"
-                value={condition}
-                onChange={(e) => setCondition(e.target.value)}
-              >
-                {CONDITIONS.map((c) => (
-                  <option key={c} value={c}>
-                    {CONDITION_LABELS[c] ?? c}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="watch-interval">Check every (minutes, min 15)</label>
-              <input
-                id="watch-interval"
-                type="number"
-                min={15}
-                max={1440}
-                value={intervalMin}
-                onChange={(e) => setIntervalMin(Number(e.target.value))}
-              />
-            </div>
-          </div>
-          <button type="submit" className="primary" disabled={creating}>
-            {creating ? <Spinner label="Creating" /> : "Create watch"}
-          </button>
-        </form>
-      </section>
 
       <section aria-label="Watches" className="pane">
         <SectionHeader
@@ -294,8 +201,8 @@ export function WatchesView({ token }: { token: string | null }) {
         )}
         {!loading && watches.length === 0 && (
           <EmptyState>
-            No watches yet. Create one above — the extension checks it in an
-            open tab, on schedule.
+            No watches yet. Ask the Agent in chat to watch a page — the
+            extension checks it in an open tab, on schedule.
           </EmptyState>
         )}
         <ul className="watch-list">

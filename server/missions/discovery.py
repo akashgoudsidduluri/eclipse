@@ -403,6 +403,45 @@ def discover_price_watch(conn, mission: dict, gmail=None) -> list[dict]:
     return out
 
 
+def discover_email_monitor(conn, mission: dict, gmail=None) -> list[dict]:
+    """email_monitor discovery (PR #7): offer/interview mails
+    matching the mission's keywords, via the Gmail connector.
+    Read-only — candidates are recorded (activity + facts +
+    briefing), never acted on. Skipped (empty list) when Gmail
+    is off; a connector error propagates to the runner (a
+    transient run failure, not a silent skip)."""
+    if not gmail_available(conn):
+        return []
+    if gmail is None:
+        from ..connectors.gmail import GmailConnector
+
+        gmail = GmailConnector()
+    keywords = [
+        k.strip().lower()
+        for k in (mission.get("config") or {}).get("keywords") or []
+        if k and k.strip()
+    ]
+    stored = _profile_for_mission(conn, mission)
+    seen = _discovered_ids(conn, mission["id"])
+    out = []
+    for mail in gmail.search_offers():
+        haystack = f"{mail.get('subject') or ''}\n{mail.get('body_redacted') or ''}".lower()
+        if keywords and not any(k in haystack for k in keywords):
+            continue
+        role, needs_confirmation = _role_from_mail(mail)
+        role_id = role["id"]
+        if role_id in seen:
+            continue
+        match = _match_candidate(role, stored)
+        out.append({
+            "kind": "role", "role": role, "match": match,
+            "source": "gmail",
+            "needs_confirmation": needs_confirmation,
+            "detail": {"role_id": role_id, "mail_id": mail.get("id")},
+        })
+    return out
+
+
 def discover(conn, mission: dict, gmail=None) -> list[dict]:
     """Discover candidate items for one mission run, by type.
     Unknown types discover nothing (the registry validates
@@ -414,6 +453,8 @@ def discover(conn, mission: dict, gmail=None) -> list[dict]:
         return discover_cold_mail(conn, mission, gmail=gmail)
     if mission_type == "price_watch":
         return discover_price_watch(conn, mission, gmail=gmail)
+    if mission_type == "email_monitor":
+        return discover_email_monitor(conn, mission, gmail=gmail)
     return []
 
 

@@ -1,21 +1,32 @@
 """Planner router (Sprint 3): open-weights-only fallback chain.
 
-Chain (plan §9, open-weights only — never Gemini/GPT as the runtime
-planner):
-  1. Own Antseed gateway (verified free, gemma-4-31b live planner)
-  2. OrcaRouter free (only when ORCA_ROUTER_BASE_URL is set — its
-     exact host is unconfirmed, so it is skipped, not guessed)
+Chain (PR #7, local-first — open-weights only, never Gemini/GPT
+as the runtime planner):
+  1. Ollama local qwen2.5:7b (free, private, no key — must be
+     running on this machine; a dead Ollama fails fast with a
+     connection error and the chain moves on)
+  2. Own Antseed gateway (verified free, gemma-4-31b live planner)
   3. Groq gpt-oss-120b
-  4. Ollama local qwen2.5:7b
-Never silently fall back from local mode to cloud: the chain is
-cloud-first by design for the demo, and a task whose constraints say
-"local only" stops at Ollama (see `local_only`).
+  4. OrcaRouter free (only when fully configured — its exact host
+     is unconfirmed, so it is skipped, not guessed)
+The order is overridable with ECLIPSE_PROVIDER_ORDER (comma
+separated provider names, e.g. "groq,ollama,antseed"); providers
+not listed keep their default relative order. There is no other
+settings mechanism in the server, so env is the switch.
+Never silently fall back from local mode to cloud: a task whose
+constraints say "local only" stops at Ollama (see `local_only`).
 
-Each call has an 8s timeout (plan §6.10 fix 7). On timeout or an
-empty response, the next model is tried at once. The model that
-answered is logged and its quota is incremented (Antseed free models
-only — the quota table tracks those; Groq/Ollama are untracked).
+Each call has a 15s timeout (plan §6.10 fix 7, raised from 8s —
+see PLANNER_TIMEOUT_S). On timeout or an empty response, the
+next model is tried at once. The model that answered is logged
+and its quota is incremented (Antseed free models only — the
+quota table tracks those; Groq/Ollama are untracked).
 Warn at 80% of the daily limit; stop cloud calls at 100%.
+
+A missing model must be VISIBLE, not silent: brain_status()
+reports the configured providers, their chain order, and (with
+a cheap probe) whether each one answers — GET /brain serves it
+and server startup logs the chain.
 
 Antseed auth (fix list item 1, 2026-11-21): the gateway key lives
 in the Secure Vault as the registered `custom.akash-antseed`
@@ -89,24 +100,69 @@ def _env(name: str, default: str | None = None) -> str | None:
     return v if v not in (None, "") else default
 
 
+# PR #7: local-first default order. ECLIPSE_PROVIDER_ORDER
+# overrides it (comma-separated names); unknown names are
+# warned about and ignored, and providers not listed keep
+# their default relative order after the listed ones.
+DEFAULT_CHAIN_ORDER = ("ollama", "antseed", "groq", "orcarouter")
+CHAIN_ORDER_ENV = "ECLIPSE_PROVIDER_ORDER"
+# The Antseed default is Akash's gateway — a user with their own
+# gateway points ANTSEED_BASE_URL at it (see README + .env.example).
+ANTSEED_DEFAULT_BASE_URL = "https://akash-antseed.duckdns.org/v1"
+
+
+def chain_order() -> list[str]:
+    """The effective provider order: ECLIPSE_PROVIDER_ORDER first
+    (when set), then any unlisted providers in default order."""
+    order: list[str] = []
+    raw = _env(CHAIN_ORDER_ENV)
+    if raw:
+        for name in raw.split(","):
+            name = name.strip().lower()
+            if not name:
+                continue
+            if name not in DEFAULT_CHAIN_ORDER:
+                logger.warning(
+                    "ignoring unknown provider %r in %s", name, CHAIN_ORDER_ENV
+                )
+            elif name not in order:
+                order.append(name)
+    for name in DEFAULT_CHAIN_ORDER:
+        if name not in order:
+            order.append(name)
+    return order
+
+
 def default_chain() -> list[Endpoint]:
-    """Build the fallback chain from the environment."""
-    chain: list[Endpoint] = []
+    """Build the fallback chain from the environment, in
+    chain_order(). Ollama is always present (local, no key);
+    Antseed is present with an env key or, failing that, with
+    the vault surrogate (ANTSEED_USE_SURROGATE=0 disables it);
+    Groq needs GROQ_API_KEY; OrcaRouter needs all three of its
+    env vars."""
+    by_name: dict[str, Endpoint] = {}
+    # Ollama first: local, free, private, no key. A machine
+    # without Ollama running just fails fast (connection
+    # refused) and the chain moves to the next provider.
+    by_name["ollama"] = Endpoint(
+        name="ollama",
+        base_url=_env("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1") or "",
+        model=_env("OLLAMA_MODEL", "qwen2.5:7b") or "",
+        api_key=None,
+    )
     antseed_key = _env("ANTSEED_API_KEY")
     antseed_base = (
-        _env("ANTSEED_BASE_URL", "https://akash-antseed.duckdns.org/v1") or ""
+        _env("ANTSEED_BASE_URL", ANTSEED_DEFAULT_BASE_URL) or ""
     )
     antseed_model = _env("ANTSEED_MODEL", "google-gemma-4-31b-it") or ""
     antseed_host = urllib.parse.urlparse(antseed_base).hostname or ""
     if antseed_key:
-        chain.append(
-            Endpoint(
-                name="antseed",
-                base_url=antseed_base,
-                model=antseed_model,
-                api_key=antseed_key,
-                quota_model=antseed_model,
-            )
+        by_name["antseed"] = Endpoint(
+            name="antseed",
+            base_url=antseed_base,
+            model=antseed_model,
+            api_key=antseed_key,
+            quota_model=antseed_model,
         )
     else:
         # No env key: authenticate with the vault-held connector
@@ -117,52 +173,91 @@ def default_chain() -> list[Endpoint]:
         # with 502, as test_plan_fails_closed_without_a_planner
         # verifies).
         if _env("ANTSEED_USE_SURROGATE", "1") != "0":
-            chain.append(
-                Endpoint(
-                    name="antseed",
-                    base_url=antseed_base,
-                    model=antseed_model,
-                    api_key=None,
-                    quota_model=antseed_model,
-                    use_surrogate=True,
-                    surrogate_connector="custom.akash-antseed",
-                    surrogate_hosts=(antseed_host,) if antseed_host else (),
-                )
+            by_name["antseed"] = Endpoint(
+                name="antseed",
+                base_url=antseed_base,
+                model=antseed_model,
+                api_key=None,
+                quota_model=antseed_model,
+                use_surrogate=True,
+                surrogate_connector="custom.akash-antseed",
+                surrogate_hosts=(antseed_host,) if antseed_host else (),
             )
+    groq_key = _env("GROQ_API_KEY")
+    if groq_key:
+        by_name["groq"] = Endpoint(
+            name="groq",
+            base_url=_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "",
+            model=_env("GROQ_MODEL", "gpt-oss-120b") or "",
+            api_key=groq_key,
+            # gpt-oss-120b has a quota row in FREE_MODELS, so its
+            # calls are tracked like the Antseed free models.
+            quota_model=_env("GROQ_MODEL", "gpt-oss-120b"),
+        )
     orca_base = _env("ORCA_ROUTER_BASE_URL")
     orca_key = _env("ORCA_ROUTER_API_KEY")
     orca_model = _env("ORCA_ROUTER_MODEL")
     if orca_base and orca_key and orca_model:
-        chain.append(
-            Endpoint(
-                name="orcarouter",
-                base_url=orca_base,
-                model=orca_model,
-                api_key=orca_key,
-            )
+        by_name["orcarouter"] = Endpoint(
+            name="orcarouter",
+            base_url=orca_base,
+            model=orca_model,
+            api_key=orca_key,
         )
-    groq_key = _env("GROQ_API_KEY")
-    if groq_key:
-        chain.append(
-            Endpoint(
-                name="groq",
-                base_url=_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "",
-                model=_env("GROQ_MODEL", "gpt-oss-120b") or "",
-                api_key=groq_key,
-                # gpt-oss-120b has a quota row in FREE_MODELS, so its
-                # calls are tracked like the Antseed free models.
-                quota_model=_env("GROQ_MODEL", "gpt-oss-120b"),
-            )
-        )
-    chain.append(
-        Endpoint(
-            name="ollama",
-            base_url=_env("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1") or "",
-            model=_env("OLLAMA_MODEL", "qwen2.5:7b") or "",
-            api_key=None,
-        )
-    )
-    return chain
+    order = chain_order()
+    return [by_name[name] for name in order if name in by_name]
+
+
+# ----------------------------------------------------------------
+# Brain status (PR #7): which providers are configured, in what
+# order, and whether each one answers. Names and models only —
+# never keys. GET /brain serves this; server startup logs it.
+# ----------------------------------------------------------------
+
+# A status probe must be cheap: 2s per provider, sequential.
+PROBE_TIMEOUT_S = 2.0
+
+
+def _auth_kind(ep: Endpoint) -> str:
+    if ep.use_surrogate:
+        return "surrogate"
+    return "key" if ep.api_key else "none"
+
+
+def probe_reachable(ep: Endpoint, timeout: float = PROBE_TIMEOUT_S) -> bool:
+    """Does this endpoint answer a cheap GET {base_url}/models?
+    Any HTTP response counts as reachable — even a 401, which
+    means the service is up but the key is wrong (a different
+    problem from a dead host). A connection error or timeout
+    means unreachable. Never raises."""
+    url = ep.base_url.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {ep.api_key}"} if ep.api_key else {}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True  # answered, even if it refused auth
+    except Exception:  # noqa: BLE001 - unreachable is a status, not an error
+        return False
+
+
+def brain_status(probe: bool = True) -> dict:
+    """{"chain": [names in order], "providers": [{name, model,
+    base_url, auth, reachable}]}. `reachable` is None when
+    probe=False (startup logging: no network on the hot path).
+    No keys anywhere in the output."""
+    chain = default_chain()
+    providers = []
+    for ep in chain:
+        providers.append({
+            "name": ep.name,
+            "model": ep.model,
+            "base_url": ep.base_url,
+            "auth": _auth_kind(ep),
+            "reachable": probe_reachable(ep) if probe else None,
+        })
+    return {"chain": [ep.name for ep in chain], "providers": providers}
 
 
 def _attach_surrogate(request, connector: str, hosts: tuple[str, ...]) -> None:

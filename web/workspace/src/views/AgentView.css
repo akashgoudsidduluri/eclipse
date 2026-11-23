@@ -212,6 +212,12 @@
   font-size: var(--text-sm);
 }
 
+/* PR #7: the model that answered, next to the source note
+ * ("Quick reply · via Ollama"). Same muted treatment. */
+.chat-provider {
+  font-size: var(--text-sm);
+}
+
 .chat-thinking {
   display: flex;
   align-items: center;
@@ -652,4 +658,190 @@
   .receipt-when {
     margin-left: 0;
   }
+}
+
+/* ---------- Chat uploads + mission draft card (PR #7) ---------- */
+
+/* The composer wrapper stacks the attach chips above the bar
+ * in both layouts (hero and pinned thread). The wrapper, not
+ * the form, owns the width — the bar keeps its own style. */
+.chat-composer-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 800px;
+  margin-inline: auto;
+}
+
+.chat-hero .chat-composer-wrap {
+  max-width: 800px;
+}
+
+/* Attach: a 36px quiet circle at the input's left end — the
+ * send circle's mirror, but unfilled (surface + border +
+ * secondary ink), so the vermilion stays the only accent. */
+.chat-attach {
+  flex-shrink: 0;
+  align-self: flex-end;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-attach:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.chat-attach:disabled {
+  opacity: 0.55;
+}
+
+/* The chips above the composer: one per file waiting to be
+ * sent. Light surface, pill radius, file name truncated. */
+.chat-attach-chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.chat-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  box-shadow: var(--shadow-card);
+}
+
+.chat-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.chat-file-ok {
+  color: var(--success);
+}
+
+/* Upload progress: a thin track inside the chip, accent fill. */
+.chat-file-progress {
+  width: 64px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+
+.chat-file-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width var(--dur-fast) var(--ease);
+}
+
+.chat-file-remove {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+}
+
+.chat-file-remove:hover {
+  color: var(--text);
+}
+
+/* Attachments under a user bubble in the thread. */
+.chat-attachments {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* The draft card spans the full thread width under the
+ * thread, like a task card — it is the one rich element
+ * after the draft reply, not a bubble. */
+.chat-draft {
+  width: 100%;
+  margin-top: var(--space-2);
+}
+
+.chat-draft-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-4);
+}
+
+.chat-draft-card h4 {
+  margin: 0 0 var(--space-2);
+}
+
+.chat-draft-card p {
+  margin: 0 0 var(--space-2);
+}
+
+.chat-draft-facts {
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  background: var(--surface-hover);
+  border-radius: var(--radius-card);
+}
+
+.chat-draft-facts ul {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.chat-draft-selector {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-3) 0;
+}
+
+.chat-draft-selector input {
+  width: 100%;
+}
+
+.chat-draft-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* The "your next message answers the question" note above
+ * the composer. */
+.chat-pending-note {
+  max-width: 800px;
+  margin: 0 auto var(--space-2);
+  text-align: center;
 }

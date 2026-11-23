@@ -1061,8 +1061,10 @@ class TestMissionTypes(MissionTestBase):
     def test_types_endpoint_lists_the_registry(self):
         result = missions_api.list_mission_types()
         by_type = {t["type"]: t for t in result["types"]}
+        # PR #7 adds email_monitor (inbox watch).
         self.assertEqual(set(by_type),
-                         {"job_hunt", "cold_mail", "price_watch"})
+                         {"job_hunt", "cold_mail", "price_watch",
+                          "email_monitor"})
         for spec in result["types"]:
             self.assertIn("label", spec)
             self.assertIn("config_schema", spec)

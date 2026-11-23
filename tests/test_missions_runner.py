@@ -777,7 +777,10 @@ class TestRunnerApiRoutes(RunnerApiTestCase):
         ) as parse:
             body = runner_api.IntakeIn(message="watch for SDE roles")
             out = runner_api.post_intake(body, _token=TOKEN)
-        parse.assert_called_once_with("watch for SDE roles")
+        # PR #7: the route passes the upload context through
+        # (empty here — no files attached to this message).
+        parse.assert_called_once_with(
+            "watch for SDE roles", upload_ids=[], conn=mock.ANY)
         self.assertEqual(out["source"], "rules")
 
     def test_get_resume_404_before_upload(self):

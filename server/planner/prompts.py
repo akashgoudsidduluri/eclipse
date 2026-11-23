@@ -114,7 +114,7 @@ def build_intake_prompt(message: str) -> str:
     """
     instructions = """\
 You draft Eclipse missions from one chat message. Return ONE JSON object, nothing else (no prose, no markdown fence):
-{"type": "job_hunt" | "cold_mail" | "price_watch",
+{"type": "job_hunt" | "cold_mail" | "price_watch" | "email_monitor",
  "name": "<short mission name>",
  "config": { ... type-specific, see below ... },
  "bounds": { ... bounds, see below ... },
@@ -131,6 +131,10 @@ Type configs (only the fields listed here exist — do not invent others):
   unless the message states one>", "condition": "changed",
   "target_price": <number or null>, "currency": "INR",
   "one_shot": true}
+- email_monitor: {"keywords": ["interview", "offer",
+  "shortlisted", "selected"]} — watch the inbox for mails
+  matching these words. Only add words the message states;
+  the defaults above are fine when it names none.
 Bounds: {"max_actions_per_day": 5, "max_applies_per_day": 3,
   "max_sends_per_day": 5, "max_spend_inr": 0, "allowed_sites": [],
   "require_approval_for": ["apply", "send"], "auto_approve": false,
@@ -144,6 +148,10 @@ Rules:
   "at most 5 mails a day" means max_sends_per_day 5.
 - A price target ("tell me when it drops below 4999 rupees") is
   a price_watch with target_price 4999.
+- Watching the inbox ("watch my inbox for interview mails",
+  "tell me when an offer mail arrives") is an email_monitor,
+  NOT a job_hunt — it only watches and reports, it never
+  applies or sends.
 - When the message names no type clearly, pick the closest one
   and list what is missing to be sure in missing_fields."""
     return f"{instructions}\n\nMESSAGE (PII-redacted): {message}"
